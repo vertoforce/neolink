@@ -354,7 +354,7 @@ fn send_to_sources(
 
 fn bucket_size_for(n: usize) -> Option<usize> {
     const MIN_BUCKET: usize = 256;
-    const MAX_BUCKET: usize = 64 * 1024;
+    const MAX_BUCKET: usize = 1024 * 1024;
     if n == 0 {
         return Some(MIN_BUCKET);
     }
