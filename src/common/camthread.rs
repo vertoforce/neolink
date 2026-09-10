@@ -28,7 +28,10 @@ use neolink_core::bc_protocol::BcCamera;
 /// keepalive, useful as a probe) and logged on miss, but they no longer drive
 /// the watchdog state machine. Other BC errors (login failure, real protocol
 /// errors) still propagate as before — only the *timeout* path is demoted.
-const FRAME_STALENESS_MS: u64 = 30_000;
+// pub(crate): fix 13 — the RTSP frame-pump's camera-frame starvation exit
+// (rtsp/factory.rs) references this same canonical threshold instead of
+// hardcoding its own literal.
+pub(crate) const FRAME_STALENESS_MS: u64 = 30_000;
 
 #[derive(Eq, PartialEq, Copy, Clone)]
 pub(crate) enum NeoCamThreadState {
@@ -112,6 +115,28 @@ impl NeoCamThread {
                                 );
                             }
                             missed_pings = 0;
+                            // fix 13: enforce frame staleness on the ping-SUCCESS
+                            // path too. Mode B of the 2026-07-31 camera C wedge:
+                            // after a dead-declare + reconnect the camera answered
+                            // pings but never delivered frames — frames_stale was
+                            // only consulted in the ping-timeout arm, so a
+                            // frames-dead/pings-alive camera was never re-declared
+                            // dead and the starved RTSP pipeline wedged forever
+                            // (zero neolink log lines for the camera during hours
+                            // of dead air). Same threshold, same teardown path as
+                            // the timeout arm. Accepted caveat: a camera with NO
+                            // consumers also has no frames and will now cycle its
+                            // BC connection every ~FRAME_STALENESS_MS; in this
+                            // deployment every camera has a permanent preload /
+                            // exec consumer, so frames always flow when healthy.
+                            if frames_stale(&last_frame_at) {
+                                log::error!(
+                                    "{watchdog_name}: pings OK but no frames for >{FRAME_STALENESS_MS}ms — declaring camera dead (fix 13)"
+                                );
+                                break Err(anyhow::anyhow!(
+                                    "Frame-staleness watchdog: no frames for >{FRAME_STALENESS_MS}ms (pings healthy)"
+                                ));
+                            }
                             continue
                         },
                         Ok(Err(neolink_core::Error::UnintelligibleReply { reply, why })) => {

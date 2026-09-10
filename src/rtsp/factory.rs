@@ -57,6 +57,56 @@ use crate::{
 /// the threshold can be tuned without a rebuild (read once at thread start).
 const RTSP_EGRESS_STALENESS_MS: u64 = 15_000;
 
+/// fix 13: frame-pump watchdog tick (ms). The pump loop used to block
+/// indefinitely in `media_rx.blocking_recv()`, so EVERY check in the loop body
+/// (egress stall, post-EOS grace exit, audio stall) only executed when a frame
+/// arrived — a frame-starved pump detected nothing, exited nothing, and logged
+/// nothing (the 2026-07-31 camera C Mode B wedge: camera reconnects, pings
+/// pass, pump starves, gst-rtsp-server keeps serving the cached prepared media
+/// as dead air with zero log output). Bounding the wait means the watchdog
+/// block runs at least this often even with no frames. Tick iterations carry
+/// no frame and MUST NOT touch the push-path counters (consecutive_errors /
+/// consecutive_backpressure / consecutive_detached / eos_signaled-reset),
+/// which assume one iteration == one push attempt — see the `let Some(data)`
+/// gate in the loop.
+const PUMP_RECV_TICK_MS: u64 = 5_000;
+
+/// fix 13: outcome of one bounded wait on the camera frame channel.
+enum PumpRecv {
+    Frame(BcMedia),
+    TimedOut,
+    Closed,
+}
+
+/// fix 13: bounded blocking receive for the frame-pump std::thread.
+///
+/// tokio 1.37's mpsc `Receiver` has no `blocking_recv_timeout`, so poll
+/// `try_recv` with a short sleep while idle. When frames are flowing,
+/// `try_recv` returns immediately and the sleep never runs (no hot-path
+/// cost). Idle-poll latency (<= POLL_MS per frame worst case) cannot affect
+/// the media clock: the appsrcs carry synthetic PTS (vid_ts / aud_ts,
+/// `set_do_timestamp(false)` + `set_is_live(false)`), not arrival times.
+fn pump_recv_timeout(
+    rx: &mut tokio::sync::mpsc::Receiver<BcMedia>,
+    timeout_ms: u64,
+) -> PumpRecv {
+    use tokio::sync::mpsc::error::TryRecvError;
+    const POLL_MS: u64 = 20;
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        match rx.try_recv() {
+            Ok(v) => return PumpRecv::Frame(v),
+            Err(TryRecvError::Disconnected) => return PumpRecv::Closed,
+            Err(TryRecvError::Empty) => {
+                if std::time::Instant::now() >= deadline {
+                    return PumpRecv::TimedOut;
+                }
+                std::thread::sleep(Duration::from_millis(POLL_MS));
+            }
+        }
+    }
+}
+
 fn rtsp_egress_staleness_ms() -> u64 {
     std::env::var("NEOLINK_RTSP_EGRESS_STALENESS_MS")
         .ok()
@@ -581,11 +631,42 @@ pub(super) async fn make_factory(
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
-                            while let Some(data) = media_rx.blocking_recv() {
+                            // fix 13: epoch-ms of the last camera media (of ANY
+                            // kind) received on media_rx. Initialised at pump
+                            // birth = a fresh starvation grace window. Drives
+                            // the camera-frame starvation exit in the watchdog
+                            // block below.
+                            let mut last_camera_frame_ms = now_epoch_ms();
+                            loop {
+                                // fix 13: bounded wait — a tick iteration
+                                // (data == None) runs the watchdog block even
+                                // when the camera delivers nothing, which is
+                                // exactly when the old blocking_recv loop went
+                                // blind.
+                                let data = match pump_recv_timeout(
+                                    &mut media_rx,
+                                    PUMP_RECV_TICK_MS,
+                                ) {
+                                    PumpRecv::Frame(d) => {
+                                        last_camera_frame_ms = now_epoch_ms();
+                                        Some(d)
+                                    }
+                                    PumpRecv::TimedOut => None,
+                                    PumpRecv::Closed => {
+                                        // Observability (fix 13): this exit —
+                                        // the upstream stream task dropped
+                                        // media_tx — used to fall out of the
+                                        // while-let with NO log line at info,
+                                        // leaving a whole class of pump deaths
+                                        // invisible at RUST_LOG=info.
+                                        log::info!(
+                                            "{name}::{stream}: camera frame channel closed — exiting frame-pump thread; factory rebuilds on next connect"
+                                        );
+                                        break;
+                                    }
+                                };
                                 // EGRESS liveness check. Runs on every arriving
-                                // frame (the loop keeps spinning during the
-                                // silent wedge precisely because frames are
-                                // still ARRIVING — that's the failure mode).
+                                // frame AND (fix 13) on every empty tick.
                                 // Compare the pay0 egress counter against its
                                 // last-advanced value/time.
                                 {
@@ -613,7 +694,8 @@ pub(super) async fn make_factory(
                                         // healthy. (Re)arm the clock.
                                         egress_last_count = egress_now;
                                         egress_last_at = now_ms;
-                                    } else if egress_last_at != 0
+                                    } else if data.is_some()
+                                        && egress_last_at != 0
                                         && now_ms.saturating_sub(egress_last_at)
                                             > egress_staleness_ms
                                     {
@@ -625,9 +707,60 @@ pub(super) async fn make_factory(
                                         // Trigger the SAME EOS path the error /
                                         // back-pressure watchdogs use — we do NOT
                                         // invent a parallel teardown.
+                                        //
+                                        // fix 13: `data.is_some()` gate keeps
+                                        // this branch's pre-fix13 semantics
+                                        // ("frames keep arriving" was implicit
+                                        // when the loop only ran on frames) —
+                                        // without it, every >=15s CAMERA-side
+                                        // gap would now also fire this consumer-
+                                        // wedge signal on a tick and churn
+                                        // rebuilds on routine RF blips. Camera-
+                                        // side gaps belong to the starvation
+                                        // branch below (30s threshold).
                                         log::warn!(
                                             "{name}::{stream}: RTSP egress stalled (no bytes for {}s) — forcing pipeline rebuild",
                                             egress_staleness_ms / 1000
+                                        );
+                                        if let Some(src) = vid_src.as_ref() {
+                                            let _ = src.end_of_stream();
+                                        }
+                                        if let Some(src) = aud_src.as_ref() {
+                                            let _ = src.end_of_stream();
+                                        }
+                                        eos_signaled = true;
+                                        egress_eos_at = now_ms;
+                                    } else if egress_last_at != 0
+                                        && now_ms
+                                            .saturating_sub(last_camera_frame_ms)
+                                            >= crate::common::FRAME_STALENESS_MS
+                                    {
+                                        // fix 13: CAMERA-FRAME STARVATION exit
+                                        // (camera C Mode B, 2026-07-31: 3
+                                        // incidents, dead air 10h/11min/6min).
+                                        // The camera stopped delivering frames
+                                        // to THIS pump (stale BC stream after a
+                                        // dead-declare + reconnect) while the
+                                        // shared media stays prepared/cached, so
+                                        // every new client silently attaches to
+                                        // a corpse. No other signal can fire:
+                                        // the egress branch above needs frames,
+                                        // camthread's pings are healthy, and
+                                        // check_live only runs on push. Exit via
+                                        // the standard EOS + grace path so the
+                                        // fix 9 kick closes consumers, the last
+                                        // session releases the media, and the
+                                        // next connect rebuilds against a fresh
+                                        // camera stream subscription. Guarded on
+                                        // egress_last_at != 0 (egress must have
+                                        // STARTED) so an idle / slow-preroll
+                                        // pipeline is never torn down — same
+                                        // arming rule as the egress watchdog.
+                                        // Threshold = the canonical camthread
+                                        // FRAME_STALENESS_MS, not a new tunable.
+                                        log::info!(
+                                            "{name}::{stream}: no camera frames for >={}ms while pipeline serving — camera-frame starvation, signaling EOS and exiting so factory rebuilds (fix 13)",
+                                            crate::common::FRAME_STALENESS_MS
                                         );
                                         if let Some(src) = vid_src.as_ref() {
                                             let _ = src.end_of_stream();
@@ -668,6 +801,15 @@ pub(super) async fn make_factory(
                                         egress_eos_at = now_ms;
                                     }
                                 }
+                                // fix 13: tick-only iteration (no frame) — the
+                                // watchdog block above has run; nothing to push.
+                                // Skipping here keeps every counter below
+                                // (consecutive_errors / consecutive_backpressure
+                                // / consecutive_detached, and the eos_signaled
+                                // reset on Sent) on its original "one iteration
+                                // == one push attempt" semantics: ticks can
+                                // neither advance nor reset them.
+                                let Some(data) = data else { continue };
                                 // Stamp arrival BEFORE the push attempt: this
                                 // is the per-frame liveness signal the
                                 // camthread ping watchdog reads. Even if the

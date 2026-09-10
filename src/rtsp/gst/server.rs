@@ -485,7 +485,14 @@ impl NeoRtspServer {
                     "{label}: kicked {kicked} RTSP client connection(s) — {reason}; consumers will reconnect into a fresh pipeline"
                 );
             } else {
-                log::debug!("{label}: zombie-client kick found no attached clients ({reason})");
+                // fix 13 observability: promoted from debug. A kick that
+                // matches zero clients while a consumer believes it is
+                // connected is exactly the invisible signature of the
+                // 2026-07-31 camera C dead-air incidents — it must be
+                // visible at the default RUST_LOG=info.
+                log::info!(
+                    "{label}: zombie-client kick found no attached clients ({reason})"
+                );
             }
         });
     }
