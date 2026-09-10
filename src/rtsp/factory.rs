@@ -459,6 +459,35 @@ pub(super) async fn make_factory(
                             // well under a second, so this threshold is
                             // comfortably past "transient" territory.
                             const EOS_THRESHOLD: u32 = 100;
+                            // Terminal-detach fast-exit (fix 4, part 2).
+                            //
+                            // Under SuspendMode::None the shared pipeline is
+                            // never reset-to-NULL on client churn (that was the
+                            // suspend-to-NULL wedge we fixed). But a genuine
+                            // FULL unprepare still happens when the LAST client
+                            // leaves (prepare_count → 0): gst-rtsp-server takes
+                            // the bin to NULL and removes our appsrc. From that
+                            // moment `check_live` returns "App source is closed"
+                            // (the appsrc's bus() is None — it left the bin) and
+                            // it will NEVER recover for THIS pipeline: a new
+                            // client triggers a brand-new bin + appsrc + frame-
+                            // pump via the factory callback. So this error is
+                            // TERMINAL, not transient. The general EOS path waits
+                            // EOS_THRESHOLD+POST_EOS_GRACE (150 ≈ 7.5 s @20fps,
+                            // and far longer if the camera stalls and the
+                            // blocking_recv loop sleeps) before exiting — during
+                            // which the doomed thread keeps its per-thread
+                            // BufferPool sockets and its media_rx BC subscription
+                            // alive. Over repeated full-drop/reconnect cycles
+                            // that leaks FDs (measured: ~12 sockets/cycle) and
+                            // BC subscriptions. We therefore detect the terminal
+                            // "App source is closed" specifically and exit FAST
+                            // (after a short confirmation window), dropping
+                            // `pools` (freeing the socketpairs) and `media_rx`
+                            // (ending the BC start_video subscription) promptly.
+                            // The factory rebuilds cleanly on the next connect.
+                            const DETACHED_FAST_EXIT_THRESHOLD: u32 = 15; // ~0.75s @20fps
+                            let mut consecutive_detached: u32 = 0;
                             // Back-pressure tolerates more before firing —
                             // a slow consumer that briefly falls behind is
                             // normal. ~20s at 20fps. A genuinely stuck
@@ -589,6 +618,7 @@ pub(super) async fn make_factory(
                                         }
                                         consecutive_errors = 0;
                                         consecutive_backpressure = 0;
+                                        consecutive_detached = 0;
                                         eos_signaled = false;
                                     }
                                     Ok(SendOutcome::BackPressured) => {
@@ -625,6 +655,33 @@ pub(super) async fn make_factory(
                                     }
                                     Err(e) => {
                                         consecutive_errors += 1;
+                                        // Terminal-detach fast path (fix 4):
+                                        // "App source is closed" means the appsrc
+                                        // left the bin (full unprepare) and will
+                                        // never recover for THIS pipeline. Count
+                                        // these specifically; after a short
+                                        // confirmation window, exit immediately
+                                        // so `pools` (socketpairs) and `media_rx`
+                                        // (BC subscription) are dropped promptly
+                                        // instead of leaking across the long
+                                        // EOS_THRESHOLD+grace window. Matched on
+                                        // the message check_live emits (bus None).
+                                        let detached = e
+                                            .to_string()
+                                            .contains("App source is closed");
+                                        if detached {
+                                            consecutive_detached += 1;
+                                            if consecutive_detached
+                                                >= DETACHED_FAST_EXIT_THRESHOLD
+                                            {
+                                                log::info!(
+                                                    "{name}::{stream}: appsrc detached (full unprepare) — fast-exiting frame-pump thread, freeing pools + BC subscription; factory rebuilds on next connect"
+                                                );
+                                                break;
+                                            }
+                                        } else {
+                                            consecutive_detached = 0;
+                                        }
                                         // Log sparsely (powers of 2) to avoid
                                         // spamming tens of thousands of lines
                                         // during a sustained outage.
