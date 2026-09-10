@@ -357,6 +357,9 @@ pub(super) async fn make_factory(
                             let mut aud_ts: u64 = 0;
                             let mut vid_ts: u64 = 0;
                             let mut pools = Default::default();
+                            // fix 8: per-track last-successful-push clocks for
+                            // the audio-stall exit (see check below).
+                            let mut push_times = PushTimes::default();
                             // Thread lifecycle: drop the frame and keep going
                             // on transient send errors, but EXIT after EOS so
                             // the next client connection rebuilds cleanly via
@@ -505,6 +508,35 @@ pub(super) async fn make_factory(
                             // briefly, the new thread spawns first). Empirically
                             // a ~2.5s grace is plenty.
                             const POST_EOS_GRACE: u32 = 50;
+                            // AUDIO-STALL exit (fix 8). Motivating incident
+                            // 2026-07-03: camera A's long-lived RTSP session went
+                            // AUDIO-ONLY wedged — video kept flowing but the
+                            // audio track delivered ~60 packets then went
+                            // permanently silent (a FRESH session to the same
+                            // camera had working audio). Browser MSE players
+                            // spin forever on the empty audio track. No
+                            // existing watchdog catches this: egress (pay0 =
+                            // video) advances, sends succeed, no errors, no
+                            // back-pressure. If the stall is neolink-side,
+                            // exiting the pump so the factory rebuilds the
+                            // session self-heals it. Guards (ALL required):
+                            //   (a) this stream advertises audio (aud_src set),
+                            //   (b) audio pushed successfully at least once
+                            //       this session (audio flowed, THEN stopped —
+                            //       video-only / audio-disabled sessions can
+                            //       never trip),
+                            //   (c) no successful audio push for >=
+                            //       AUDIO_STALL_EXIT_SECS,
+                            //   (d) video pushed successfully within the last
+                            //       AUDIO_STALL_VIDEO_FRESH_MS (whole-stream
+                            //       outages/reconnects stay owned by the
+                            //       existing watchdogs and never trip this).
+                            // Exit reuses the egress-stall EOS machinery
+                            // verbatim (EOS both srcs → EGRESS_POST_EOS_GRACE_MS
+                            // → the same terminal break fix 4 established) —
+                            // no new teardown mechanics.
+                            const AUDIO_STALL_EXIT_SECS: u64 = 10;
+                            const AUDIO_STALL_VIDEO_FRESH_MS: u64 = 2_000;
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
@@ -516,6 +548,7 @@ pub(super) async fn make_factory(
                                     &mut vid_ts,
                                     &mut aud_ts,
                                     &stream_config,
+                                    &mut push_times,
                                 );
                             }
 
@@ -577,6 +610,35 @@ pub(super) async fn make_factory(
                                         eos_signaled = true;
                                         egress_eos_at = now_ms;
                                     }
+                                    // Independent of the egress if/else chain
+                                    // above (which takes the "counter advanced"
+                                    // branch on virtually every frame while
+                                    // video flows — exactly when THIS check
+                                    // must run).
+                                    if egress_eos_at == 0
+                                        && aud_src.is_some()
+                                        && push_times.audio_ms != 0
+                                        && now_ms.saturating_sub(push_times.audio_ms)
+                                            >= AUDIO_STALL_EXIT_SECS * 1000
+                                        && push_times.video_ms != 0
+                                        && now_ms.saturating_sub(push_times.video_ms)
+                                            <= AUDIO_STALL_VIDEO_FRESH_MS
+                                    {
+                                        // Audio-stall exit (fix 8) — see the
+                                        // AUDIO_STALL_EXIT_SECS doc-comment.
+                                        log::warn!(
+                                            "{name}::{stream}: audio stalled {}s while video flows — exiting frame-pump so factory rebuilds session (fix 8)",
+                                            now_ms.saturating_sub(push_times.audio_ms) / 1000
+                                        );
+                                        if let Some(src) = vid_src.as_ref() {
+                                            let _ = src.end_of_stream();
+                                        }
+                                        if let Some(src) = aud_src.as_ref() {
+                                            let _ = src.end_of_stream();
+                                        }
+                                        eos_signaled = true;
+                                        egress_eos_at = now_ms;
+                                    }
                                 }
                                 // Stamp arrival BEFORE the push attempt: this
                                 // is the per-frame liveness signal the
@@ -604,6 +666,7 @@ pub(super) async fn make_factory(
                                     &mut vid_ts,
                                     &mut aud_ts,
                                     &stream_config,
+                                    &mut push_times,
                                 ) {
                                     Ok(SendOutcome::Sent) => {
                                         if consecutive_errors > 0 {
@@ -784,6 +847,15 @@ pub(crate) enum SendOutcome {
     BackPressured,
 }
 
+/// fix 8: epoch-ms of the last SUCCESSFUL (Sent, not back-pressured, not
+/// dropped-on-near-full) push into each appsrc. Written by send_to_sources,
+/// read by the frame-pump's audio-stall check. 0 = never pushed this session.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct PushTimes {
+    pub(crate) video_ms: u64,
+    pub(crate) audio_ms: u64,
+}
+
 fn send_to_sources(
     data: BcMedia,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
@@ -792,6 +864,7 @@ fn send_to_sources(
     vid_ts: &mut u64,
     aud_ts: &mut u64,
     stream_config: &StreamConfig,
+    push_times: &mut PushTimes,
 ) -> AnyResult<SendOutcome> {
     // Track whether ANY push in this call hit Flushing. The video path is
     // the only one that drives back-pressure recovery — audio is dropped
@@ -809,14 +882,14 @@ fn send_to_sources(
                     log::debug!("Audio buffer near capacity, dropping AAC frame");
                 } else {
                     log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts));
-                    if send_to_appsrc(
+                    match send_to_appsrc(
                         aud_src,
                         aac.data,
                         Duration::from_micros(*aud_ts),
                         pools,
-                    )? == SendOutcome::BackPressured
-                    {
-                        outcome = SendOutcome::BackPressured;
+                    )? {
+                        SendOutcome::BackPressured => outcome = SendOutcome::BackPressured,
+                        SendOutcome::Sent => push_times.audio_ms = now_epoch_ms(),
                     }
                 }
             }
@@ -832,14 +905,14 @@ fn send_to_sources(
                     log::debug!("Audio buffer near capacity, dropping ADPCM frame");
                 } else {
                     log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts));
-                    if send_to_appsrc(
+                    match send_to_appsrc(
                         aud_src,
                         adpcm.data,
                         Duration::from_micros(*aud_ts),
                         pools,
-                    )? == SendOutcome::BackPressured
-                    {
-                        outcome = SendOutcome::BackPressured;
+                    )? {
+                        SendOutcome::BackPressured => outcome = SendOutcome::BackPressured,
+                        SendOutcome::Sent => push_times.audio_ms = now_epoch_ms(),
                     }
                 }
             }
@@ -863,10 +936,9 @@ fn send_to_sources(
                     log::debug!("Video buffer near capacity, dropping video frame");
                 } else {
                     log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
-                    if send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?
-                        == SendOutcome::BackPressured
-                    {
-                        outcome = SendOutcome::BackPressured;
+                    match send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)? {
+                        SendOutcome::BackPressured => outcome = SendOutcome::BackPressured,
+                        SendOutcome::Sent => push_times.video_ms = now_epoch_ms(),
                     }
                 }
             }
