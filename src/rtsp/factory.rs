@@ -246,10 +246,41 @@ pub(super) async fn make_factory(
                             let mut aud_ts: u64 = 0;
                             let mut vid_ts: u64 = 0;
                             let mut pools = Default::default();
+                            // Thread resilience: drop the frame and keep going
+                            // on any send error. Empirically the wedge story:
+                            //   - Exiting on first error (original): dead thread,
+                            //     dead pipeline, hours-long wedges.
+                            //   - Exiting on N=500 consecutive (e3a0ec4): thread
+                            //     exits cleanly, but the outer factory never
+                            //     rebuilds because Frigate's go2rtc keeps its
+                            //     TCP connection open — no new-client event
+                            //     fires, pipeline stays orphaned. Observed
+                            //     2026-04-22 05:51: thread exited, stream dead
+                            //     for 72 min until segment-watchdog bounced us.
+                            //   - Never exit (this): thread runs forever
+                            //     pulling from media_rx, silently drops frames
+                            //     if appsrc is dead. If appsrc recovers (state
+                            //     transition finishes), sends succeed again
+                            //     and the stream resumes. If it's permanently
+                            //     dead, segment-watchdog (external) bounces
+                            //     neolink — which is the correct authority
+                            //     for that decision, since we can't distinguish
+                            //     "transient" from "permanent" from inside
+                            //     this thread anyway.
+                            let mut consecutive_errors: u32 = 0;
+                            // One-shot per cascade: fire EOS once when we
+                            // cross EOS_THRESHOLD, don't spam. Reset on
+                            // successful send so a future cascade can retry.
+                            let mut eos_signaled = false;
+                            // 100 consecutive errors at 20fps ≈ 5s of sustained
+                            // failure. Transient state transitions clear in
+                            // well under a second, so this threshold is
+                            // comfortably past "transient" territory.
+                            const EOS_THRESHOLD: u32 = 100;
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
-                                send_to_sources(
+                                let _ = send_to_sources(
                                     buffered,
                                     &mut pools,
                                     &vid_src,
@@ -257,12 +288,12 @@ pub(super) async fn make_factory(
                                     &mut vid_ts,
                                     &mut aud_ts,
                                     &stream_config,
-                                )?;
+                                );
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
                             while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(
+                                match send_to_sources(
                                     data,
                                     &mut pools,
                                     &vid_src,
@@ -270,11 +301,59 @@ pub(super) async fn make_factory(
                                     &mut vid_ts,
                                     &mut aud_ts,
                                     &stream_config,
-                                );
-                                if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
+                                ) {
+                                    Ok(()) => {
+                                        if consecutive_errors > 0 {
+                                            log::info!(
+                                                "{name}::{stream}: send recovered after {consecutive_errors} errors"
+                                            );
+                                        }
+                                        consecutive_errors = 0;
+                                        eos_signaled = false;
+                                    }
+                                    Err(e) => {
+                                        consecutive_errors += 1;
+                                        // Log sparsely (powers of 2) to avoid
+                                        // spamming tens of thousands of lines
+                                        // during a sustained outage.
+                                        if consecutive_errors.is_power_of_two() {
+                                            log::info!(
+                                                "{name}::{stream}: send error #{consecutive_errors} (dropping frame, thread continues): {e:?}"
+                                            );
+                                        }
+                                        // Layer 2 self-recovery: at sustained
+                                        // failure, proactively EOS the appsrcs
+                                        // to force the shared pipeline to tear
+                                        // down. Connected clients disconnect
+                                        // (including Frigate's persistent
+                                        // go2rtc); their reconnect triggers
+                                        // the factory callback → fresh media
+                                        // → fresh frame-pump thread. Without
+                                        // this, Frigate's persistent TCP
+                                        // connection prevents the last-client-
+                                        // disconnect event that SuspendMode::
+                                        // Reset needs to rebuild — and the
+                                        // stream wedges until segment-watchdog
+                                        // bounces us externally (~2min).
+                                        // EOS is no-op on truly-dead appsrcs;
+                                        // in that case we fall back to the
+                                        // watchdog as before.
+                                        if consecutive_errors == EOS_THRESHOLD
+                                            && !eos_signaled
+                                        {
+                                            log::warn!(
+                                                "{name}::{stream}: {EOS_THRESHOLD} consecutive errors — signaling EOS to force pipeline rebuild"
+                                            );
+                                            if let Some(src) = vid_src.as_ref() {
+                                                let _ = src.end_of_stream();
+                                            }
+                                            if let Some(src) = aud_src.as_ref() {
+                                                let _ = src.end_of_stream();
+                                            }
+                                            eos_signaled = true;
+                                        }
+                                    }
                                 }
-                                r?;
                             }
                             log::trace!("All media recieved");
                             AnyResult::Ok(())
@@ -343,8 +422,23 @@ fn send_to_sources(
         BcMedia::Iframe(BcMediaIframe { data, .. })
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?;
+                // Mirror the audio drop-on-near-full (upstream PR #399)
+                // for the video path too. Without this, a backpressure
+                // spike on the video appsrc caused `send_to_appsrc` to
+                // fail → the frame-pump thread exited via `r?` → shared
+                // pipeline orphaned → 1h+ DESCRIBE wedge (observed
+                // 2026-04-21 06:28 "Buffer full on vidsrc" → silent
+                // starve until segment-watchdog bounced neolink 1h 13m
+                // later). Dropping a frame leaves a brief visual glitch
+                // until the next keyframe; a wedged pipeline leaves a
+                // black stream for minutes.
+                let max = vid_src.max_bytes();
+                if max > 0 && vid_src.current_level_bytes() >= max * 9 / 10 {
+                    log::debug!("Video buffer near capacity, dropping video frame");
+                } else {
+                    log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
+                    send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?;
+                }
             }
             const MICROSECONDS: u64 = 1000000;
             *vid_ts += MICROSECONDS / stream_config.fps as u64;
@@ -987,7 +1081,12 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
     Ok(queue)
 }
 
-fn buffer_size(bitrate: u32) -> u32 {
-    // 0.1 seconds (according to bitrate) or 4kb what ever is larger
-    std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+fn buffer_size(_bitrate: u32) -> u32 {
+    // Fixed 10 MB video buffer. Original formula (bitrate*2/8) gave ~1.5 MB
+    // for our 6 Mbps 4K H.265 camera A stream — tight enough that a single
+    // oversize I-frame plus a brief consumer stall would fill to the 90%
+    // drop threshold. 10 MB is ~13 s of average bitrate / ~3 s of
+    // sustained peak, comfortably above any realistic go2rtc/Frigate
+    // hiccup. RAM cost is trivial (per-stream, one stream).
+    10 * 1024 * 1024
 }

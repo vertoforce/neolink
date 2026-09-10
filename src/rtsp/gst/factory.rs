@@ -43,10 +43,22 @@ impl NeoMediaFactory {
         factory.set_eos_shutdown(false);
         factory.set_stop_on_disconnect(false);
         // factory.set_publish_clock_mode(gstreamer_rtsp_server::RTSPPublishClockMode::Clock);
-        // Keep the pipeline alive when clients disconnect instead of tearing
-        // it down and rebuilding. Reset mode causes resource churn when
-        // monitoring tools periodically probe the stream.
-        factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::None);
+        // SuspendMode::Reset — required safety net. The frame-pump std::thread
+        // can still die on send-errors our drop-on-near-full guards don't
+        // cover (e.g. transient GStreamer state transitions mid-pause). When
+        // it does, Reset mode rebuilds the pipeline (including a new thread)
+        // on next client connect. `None` mode would leave the dead pipeline
+        // around forever — observed 2026-04-21 06:28, video-path backpressure
+        // killed the thread and wedged the stream for 1h 13m until the
+        // segment-watchdog bounced neolink.
+        //
+        // Trade-off: a fast client reconnect racing a teardown can also
+        // wedge briefly (observed 2026-04-21 05:23, 2min outage). That's
+        // the lesser failure mode — self-heals within one watchdog cycle.
+        //
+        // The drop-on-near-full guards (audio: d84c639, video: commit
+        // adding this comment) *plus* Reset together are the full fix.
+        factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::Reset);
         factory.set_launch("videotestsrc pattern=\"snow\" ! video/x-raw,width=896,height=512,framerate=25/1 ! textoverlay name=\"inittextoverlay\" text=\"Stream not Ready\" valignment=top halignment=left font-desc=\"Sans, 32\" ! jpegenc ! rtpjpegpay name=pay0");
         factory.set_transport_mode(RTSPTransportMode::PLAY);
         factory
