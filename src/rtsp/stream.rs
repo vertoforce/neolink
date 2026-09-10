@@ -20,8 +20,11 @@ pub(crate) async fn stream_main(
     let mounts = rtsp
         .mount_points()
         .ok_or(anyhow!("RTSP server lacks mount point"))?;
-    // Create the factory
-    let (factory, thread) = make_factory(camera, stream).await?;
+    // Create the factory. fix 9: the factory's frame-pump gets a handle to
+    // the server + this stream's mount paths so a terminally-dead pipeline
+    // can kick its starved-but-still-connected clients (see factory.rs).
+    let paths_arc = std::sync::Arc::new(paths.to_vec());
+    let (factory, thread) = make_factory(camera, stream, rtsp.clone(), paths_arc).await?;
 
     factory.add_permitted_roles(users);
 

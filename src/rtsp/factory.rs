@@ -19,7 +19,11 @@ use neolink_core::{
 };
 use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
-use crate::{common::{now_epoch_ms, NeoInstance}, rtsp::gst::NeoMediaFactory, AnyResult};
+use crate::{
+    common::{now_epoch_ms, NeoInstance},
+    rtsp::gst::{NeoMediaFactory, NeoRtspServer},
+    AnyResult,
+};
 
 /// EGRESS liveness watchdog tunable (canonical location — reference this const,
 /// do not hardcode the literal in the loop logic).
@@ -200,6 +204,12 @@ enum ClientMsg {
 pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
+    // fix 9: the pump needs a route back to the RTSP server to kick
+    // starved-but-connected clients when it terminally exits, and the mount
+    // paths of THIS stream to scope the kick. See the zombie-client kick
+    // comment at the bottom of the frame-pump thread.
+    rtsp: NeoRtspServer,
+    paths: Arc<Vec<String>>,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
     let (client_tx, mut client_rx) = mpsc(100);
     // Create the task that creates the pipelines
@@ -211,6 +221,19 @@ pub(super) async fn make_factory(
         // common/camthread.rs for the design rationale.
         let last_frame_at = camera.last_frame_at().await?;
 
+        // fix 9: pipeline GENERATION counter for this stream. Incremented on
+        // every NewClient (i.e. every pipeline build); each frame-pump thread
+        // remembers the generation it was born under. On terminal exit a pump
+        // only kicks clients if it is STILL the newest generation — if a
+        // newer pipeline exists, any connected client belongs to that
+        // (healthy) pipeline and kicking it would churn a working stream
+        // (worst case: an old pump kicking the new pipeline's client, whose
+        // reconnect builds another pipeline, whose predecessor's exit kicks
+        // again — a ping-pong loop). The guard makes the kick fire at most
+        // once per terminal pipeline death, bounded by the pump-exit paths'
+        // own thresholds.
+        let pipeline_generation = Arc::new(AtomicU64::new(0));
+
         while let Some(msg) = client_rx.recv().await {
             match msg {
                 ClientMsg::NewClient { element, reply } => {
@@ -218,6 +241,11 @@ pub(super) async fn make_factory(
                     let camera = camera.clone();
                     let name = name.clone();
                     let last_frame_at = last_frame_at.clone();
+                    let rtsp = rtsp.clone();
+                    let paths = paths.clone();
+                    let pipeline_generation = pipeline_generation.clone();
+                    let my_generation =
+                        pipeline_generation.fetch_add(1, Ordering::SeqCst) + 1;
                     tokio::task::spawn(async move {
                         clear_bin(&element)?;
                         log::trace!("{name}::{stream}: Starting camera");
@@ -791,6 +819,50 @@ pub(super) async fn make_factory(
                                         }
                                     }
                                 }
+                            }
+                            // fix 9 — ZOMBIE-CLIENT KICK (the camera C storm
+                            // root-cause fix, 6 bursts on 2026-07-06).
+                            //
+                            // Every exit from the loop above means THIS
+                            // pipeline can never deliver another frame: the
+                            // appsrc is detached (terminal fast-exit, fix 4),
+                            // or we EOS'd and gave up (error / back-pressure /
+                            // egress-stall / audio-stall paths), or media_rx
+                            // closed. All of those paths end with the same
+                            // contract: "the factory rebuilds on the next
+                            // client connect". The camera C storm proved that
+                            // contract can never complete on its own: during a
+                            // >30s camera outage the consumer's RTSP session
+                            // expires SERVER-side (silent cleanup() / stale
+                            // sweep) which unprepares the shared media, but
+                            // go2rtc's TCP connection is never closed — so the
+                            // only consumer sits alive-but-starved, never
+                            // reconnects, and "next client connect" never
+                            // happens. Frames flowed camera→neolink for 10–18
+                            // minutes per burst while zero bytes egressed,
+                            // until segment-watchdog restarted the container.
+                            //
+                            // Fix: on terminal pump exit, force-close the RTSP
+                            // client connections still attached to this
+                            // stream's paths (exact-path match) so the
+                            // consumer SEES the death and reconnects into a
+                            // fresh factory callback within seconds. If no
+                            // client is attached (the normal fix 4 churn
+                            // case: everyone already left), the kick is a
+                            // no-op. Generation-guarded (see
+                            // pipeline_generation above) so a stale pump can
+                            // never kick a newer, healthy pipeline's clients.
+                            if pipeline_generation.load(Ordering::SeqCst) == my_generation {
+                                rtsp.kick_clients_of_paths(
+                                    paths,
+                                    format!("{name}::{stream}"),
+                                    "frame-pump exited; this pipeline can never stream again"
+                                        .to_string(),
+                                );
+                            } else {
+                                log::debug!(
+                                    "{name}::{stream}: frame-pump exiting without client kick — a newer pipeline generation exists"
+                                );
                             }
                             log::trace!("{name}::{stream}: frame-pump thread done");
                             AnyResult::Ok(())

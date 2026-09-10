@@ -223,8 +223,40 @@ impl NeoRtspServer {
                     // Removed ones.
                     let margin_ms = session_stale_reap_margin_ms();
                     let now = glib::monotonic_time();
-                    let mut reaped_count: usize = 0;
-                    let mut reaped_dbg: Vec<(Option<glib::GString>, i64)> = Vec::new();
+                    // fix 9 restructure: the sweep used to pool-Remove the
+                    // stale session directly. That is invisible at the TCP
+                    // level AND it cascades immediately — gst-rtsp-server's
+                    // client watches the pool's session-removed signal and
+                    // detaches the session from the client — so by the time
+                    // anything later tries to find "the client owning this
+                    // session", the client is session-less and unmatchable
+                    // (proven in the iso GATE Z run 2026-07-09: neither a
+                    // sessionid- nor a path-based lookup found the frozen
+                    // consumer after the pool-Remove; it stayed a zombie).
+                    // If the peer is genuinely CLOSE_WAIT (the case this
+                    // sweep was built for), a client close() is a no-op
+                    // cleanup; but if the peer is ALIVE and merely starved
+                    // (camera C 2026-07-06: camera stopped delivering frames
+                    // >30s, so RTP stopped, so the session went quiet — while
+                    // go2rtc's TCP connection sat healthy and blocked on
+                    // read), a silent reap turns it into a zombie that never
+                    // reconnects. So the sweep now runs in three passes:
+                    //   1) READ-ONLY pool filter: collect the stale band
+                    //      (remaining <= margin, INCLUDING already-expired 0
+                    //      — the client may still hold a session cleanup()
+                    //      beat us to).
+                    //   2) On the glib main context (owner of the client
+                    //      watches): close() every client owning a stale
+                    //      session — the TCP FIN/RST makes the expiry VISIBLE
+                    //      so an alive-but-starved consumer reconnects
+                    //      immediately; while its camera is still down the
+                    //      DESCRIBEs fail fast (fix 6) and retry, recovering
+                    //      the instant the camera returns instead of waiting
+                    //      for segment-watchdog.
+                    //   3) Then pool-Remove the stale sessions (same reap the
+                    //      sweep always did, just after the kick instead of
+                    //      before it).
+                    let mut stale: Vec<(Option<glib::GString>, i64)> = Vec::new();
                     sessions.filter(Some(&mut |_, session| {
                         let timeout_ms = (session.timeout() as i64).saturating_mul(1000);
                         let remaining_ms = session.next_timeout_usec(now) as i64;
@@ -236,29 +268,84 @@ impl NeoRtspServer {
                             timeout_ms,
                             since_touch_ms,
                         );
-                        // Reap iff the session has a real (non-zero) timeout AND
-                        // its remaining-to-expiry has decayed into the narrow
-                        // pre-expiry margin (0 < remaining <= margin). A
-                        // freshly-/recently-touched live session has remaining
-                        // far above the margin, so it is never reaped here. We
-                        // require remaining > 0 so we don't double-handle a
-                        // session `cleanup()` already expired this same pass.
-                        if timeout_ms > 0 && remaining_ms > 0 && remaining_ms <= margin_ms {
-                            reaped_count += 1;
-                            reaped_dbg.push((session.sessionid(), remaining_ms));
-                            RTSPFilterResult::Remove
-                        } else {
-                            RTSPFilterResult::Keep
+                        // Stale iff the session has a real (non-zero) timeout
+                        // AND its remaining-to-expiry has decayed into the
+                        // narrow pre-expiry margin. A freshly-/recently-
+                        // touched live session has remaining far above the
+                        // margin, so it is never selected here.
+                        if timeout_ms > 0 && remaining_ms <= margin_ms {
+                            stale.push((session.sessionid(), remaining_ms));
                         }
+                        RTSPFilterResult::Keep
                     }));
-                    if reaped_count > 0 {
+                    if !stale.is_empty() {
                         log::info!(
-                            "RTSP stale-session sweep — reaped {} half-dead session(s) (remaining<={}ms of {}s timeout, peer likely CLOSE_WAIT): {:?}",
-                            reaped_count,
+                            "RTSP stale-session sweep — {} stale session(s) (remaining<={}ms of {}s timeout): {:?}; closing owners then reaping",
+                            stale.len(),
                             margin_ms,
                             SESSION_TIMEOUT_SECS,
-                            reaped_dbg,
+                            stale,
                         );
+                        let stale_ids: Vec<glib::GString> =
+                            stale.iter().filter_map(|(id, _)| id.clone()).collect();
+                        let kick_server = clean_up_server.clone();
+                        glib::MainContext::default().invoke(move || {
+                            // Pass 2 — collect the owning clients first, close
+                            // AFTER the filter returns (no client mutation
+                            // while the server iterates its client list).
+                            let mut owners: Vec<gstreamer_rtsp_server::RTSPClient> = Vec::new();
+                            kick_server.client_filter(Some(&mut |_, client| {
+                                let owns = std::cell::Cell::new(false);
+                                client.session_filter(Some(&mut |_, session| {
+                                    if session
+                                        .sessionid()
+                                        .map(|sid| stale_ids.contains(&sid))
+                                        .unwrap_or(false)
+                                    {
+                                        owns.set(true);
+                                    }
+                                    RTSPFilterResult::Keep
+                                }));
+                                if owns.get() {
+                                    owners.push(client.clone());
+                                }
+                                RTSPFilterResult::Keep
+                            }));
+                            let kicked = owners.len();
+                            for client in owners {
+                                client.close();
+                            }
+                            if kicked > 0 {
+                                log::info!(
+                                    "RTSP stale-session sweep — closed {kicked} client connection(s) owning stale session(s) (alive-but-starved peers now reconnect instead of zombieing)"
+                                );
+                            }
+                            // Pass 3 — the reap the sweep always did. close()
+                            // above already cascades session removal for owned
+                            // sessions via the closed hook; this pass catches
+                            // the ownerless leftovers (true CLOSE_WAIT with
+                            // the client object already gone).
+                            let mut reaped_count: usize = 0;
+                            if let Some(sessions) = kick_server.session_pool() {
+                                sessions.filter(Some(&mut |_, session| {
+                                    if session
+                                        .sessionid()
+                                        .map(|sid| stale_ids.contains(&sid))
+                                        .unwrap_or(false)
+                                    {
+                                        reaped_count += 1;
+                                        RTSPFilterResult::Remove
+                                    } else {
+                                        RTSPFilterResult::Keep
+                                    }
+                                }));
+                            }
+                            if reaped_count > 0 {
+                                log::debug!(
+                                    "RTSP stale-session sweep — pool-reaped {reaped_count} stale session(s)"
+                                );
+                            }
+                        });
                     }
                 }
                 // 2s sweep handles the residual case where `closed` didn't
@@ -315,6 +402,92 @@ impl NeoRtspServer {
 
     pub(crate) async fn get_users(&self) -> AnyResult<HashSet<String>> {
         self.imp().get_users().await
+    }
+
+    /// fix 9 — zombie-client kick: force-close the TCP connection of every
+    /// RTSP client whose session is attached to one of `paths`.
+    ///
+    /// WHY (the camera C storm, 6 bursts on 2026-07-06): when a marginal-WiFi
+    /// camera stops delivering frames for >SESSION_TIMEOUT_SECS, RTP egress
+    /// stops, so the consumer's RTSP session stops being touched and is
+    /// silently expired server-side (the 30s `cleanup()` — which logs only at
+    /// debug — or the stale-session sweep). Removing a session from the pool
+    /// does NOT close the owning client's TCP connection: a TCP-interleaved
+    /// consumer like go2rtc keeps its socket open and blocks on read forever.
+    /// When the session release unprepares the shared media, the frame-pump
+    /// correctly fast-exits on the terminal "App source is closed" (fix 4) —
+    /// but its exit contract, "the factory rebuilds on the next client
+    /// connect", never completes because the ONLY consumer still believes its
+    /// existing connection is fine and never reconnects. Result: frames flow
+    /// camera→neolink while the consumer starves for 10–18 min until
+    /// segment-watchdog escalates to a container restart.
+    ///
+    /// FIX: make the breakage VISIBLE at the TCP level. `RTSPClient::close()`
+    /// (gst_rtsp_client_close: "Close the connection of client and remove all
+    /// media it was managing") sends the peer a FIN/RST; go2rtc's reconnect
+    /// loop then re-DESCRIBEs within seconds, driving a fresh factory
+    /// callback → fresh pipeline → fresh appsrc. If the peer really was gone
+    /// (genuine CLOSE_WAIT), close() is a no-op cleanup.
+    ///
+    /// Path matching is EXACT (matches() reports the matched byte count; we
+    /// require it to equal the candidate path's length) so a mainStream kick
+    /// can never collateral-kick a subStream client via the bare "/<cam>"
+    /// alias prefix.
+    ///
+    /// Runs on the glib main context (the thread that owns the client watches)
+    /// rather than the caller's thread — same discipline as every other
+    /// client-list mutation in gst-rtsp-server. The closure is non-blocking
+    /// and O(clients × sessions), so it cannot re-create the fix 6
+    /// frozen-main-loop hazard. Fire-and-forget by design: the caller (a
+    /// dying frame-pump thread or the sweep) must not block on the glib loop.
+    pub(crate) fn kick_clients_of_paths(
+        &self,
+        paths: Arc<Vec<String>>,
+        label: String,
+        reason: String,
+    ) {
+        let server = self.clone();
+        glib::MainContext::default().invoke(move || {
+            // Collect matches first, close AFTER the filter returns — no
+            // client mutation while the server iterates its client list.
+            let mut matched: Vec<gstreamer_rtsp_server::RTSPClient> = Vec::new();
+            server.client_filter(Some(&mut |_, client| {
+                // Cell instead of `mut bool`: the nested FnMut filter
+                // closures would otherwise need overlapping &mut borrows.
+                let attached = std::cell::Cell::new(false);
+                client.session_filter(Some(&mut |_, session| {
+                    session.filter(Some(&mut |_, media| {
+                        if !attached.get()
+                            && paths.iter().any(|p| {
+                                media
+                                    .matches(p)
+                                    .map(|m| m as usize == p.len())
+                                    .unwrap_or(false)
+                            })
+                        {
+                            attached.set(true);
+                        }
+                        RTSPFilterResult::Keep
+                    }));
+                    RTSPFilterResult::Keep
+                }));
+                if attached.get() {
+                    matched.push(client.clone());
+                }
+                RTSPFilterResult::Keep
+            }));
+            let kicked = matched.len();
+            for client in matched {
+                client.close();
+            }
+            if kicked > 0 {
+                log::info!(
+                    "{label}: kicked {kicked} RTSP client connection(s) — {reason}; consumers will reconnect into a fresh pipeline"
+                );
+            } else {
+                log::debug!("{label}: zombie-client kick found no attached clients ({reason})");
+            }
+        });
     }
 }
 
