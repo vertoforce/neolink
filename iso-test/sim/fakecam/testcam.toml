@@ -1,0 +1,13 @@
+# Config for pointing neolink at the fake camera. Everything here is fake:
+# loopback address, generic camera name, throwaway password.
+bind = "127.0.0.1"
+bind_port = 8554
+
+[[cameras]]
+name = "testcam"
+address = "127.0.0.1:9000"
+username = "admin"
+password = "password123"
+stream = "main"
+discovery = "none"
+max_encryption = "bcencrypt"

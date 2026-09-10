@@ -23,9 +23,10 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SIM="$REPO/iso-test/sim"
-DEVTEST="$(dirname "$REPO")/devtest.sh"
+DEVTEST="$SIM/devtest.sh"
 PREFIX="${2:-neolink-fx}"
 IMAGE="${AB_IMAGE:-neolink:devbuild}"
+. "$SIM/ab_rev.sh"
 
 # fix -> "arm-file:shim-file:fixed-rev:prefix-rev:test-filter"
 declare -A PLAN=(
@@ -50,6 +51,7 @@ ensure_ctr() {
 run_one() {
   local fix="$1"
   IFS=: read -r arm shim fixed_rev prefix_rev filter <<<"${PLAN[$fix]}"
+  prefix_rev="$(ab_resolve_rev "$prefix_rev")" || return 1
   echo "=============== $fix ==============="
 
   local fixed_dir prefix_dir

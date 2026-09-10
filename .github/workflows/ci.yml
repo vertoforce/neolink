@@ -1,0 +1,33 @@
+name: ci
+
+# The quick tier of iso-test/sim/verify.sh, run in the same Debian trixie
+# environment the release image is built in, so the gstreamer and gst-rtsp-server
+# versions match what ships. Nothing here needs a secret.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quick:
+    name: cargo test + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Dockerfile's build stage installs the crate's build dependencies
+      # and compiles it, so the image is also the test environment. -f is not
+      # optional: .dockerignore excludes the Dockerfile from the context.
+      - name: Build the toolchain image
+        run: docker build -f Dockerfile --target build -t neolink:ci .
+
+      - name: cargo test --release --workspace
+        run: |
+          docker run --rm -w /usr/local/src/neolink neolink:ci \
+            cargo test --release --workspace
+
+      - name: cargo clippy
+        run: |
+          docker run --rm -w /usr/local/src/neolink neolink:ci \
+            sh -c 'rustup component add clippy >/dev/null 2>&1;
+                   cargo clippy --release --workspace --all-targets'

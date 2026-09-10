@@ -1,0 +1,24 @@
+[package]
+name = "neolink-fakecam"
+description = "A fake Baichuan camera server for testing neolink without hardware"
+version = "0.1.0"
+edition = "2018"
+license = "AGPL-3.0-or-later"
+publish = false
+
+# Own workspace: excluded from the neolink workspace (see the root Cargo.toml).
+[workspace]
+
+[[bin]]
+name = "fakecam"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.70"
+bytes = "1.6.0"
+clap = { version = "4.2.2", features = ["derive"] }
+env_logger = "0.11.3"
+log = "0.4.17"
+md5 = "0.7.0"
+neolink_core = { path = "../../../crates/core", version = "0.6.3-rc.3", features = ["test-server"] }
+tokio = { version = "1.27.0", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
