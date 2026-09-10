@@ -1,7 +1,10 @@
 use gstreamer::ClockTime;
 use std::{
     collections::HashMap,
-    sync::atomic::Ordering,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -17,6 +20,46 @@ use neolink_core::{
 use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
 use crate::{common::{now_epoch_ms, NeoInstance}, rtsp::gst::NeoMediaFactory, AnyResult};
+
+/// EGRESS liveness watchdog tunable (canonical location — reference this const,
+/// do not hardcode the literal in the loop logic).
+///
+/// This is a NEW, independent safety net that sits alongside the three existing
+/// load-bearing patches (SuspendMode::Reset + stop_on_disconnect in gst/factory.rs,
+/// the RECEIVE-side FRAME_STALENESS_MS watchdog in camthread.rs, and the
+/// EOS-at-100-errors / back-pressure-EOS exit below). It catches ONE failure mode
+/// the others structurally cannot:
+///
+///   The "silent wedge" (observed 2026-05-28 14:14→17:06 UTC on `camera A`): the
+///   GStreamer appsrc consumer (the RTSP transmit side) stalls, but
+///   - frames keep ARRIVING from the camera, so the RECEIVE-side
+///     FRAME_STALENESS_MS watchdog stays quiet (camera is healthy);
+///   - the appsrc drop-on-near-full guard silently drops frames rather than
+///     returning an Err, so `consecutive_errors` never climbs to EOS_THRESHOLD;
+///   - the BC subscriber channel fills and drops messages ("Subscriber channel
+///     full … dropping message"), again with no send ERROR surfaced here.
+///   Net result under the prior code: nothing fired until consecutive_errors
+///   eventually tripped ~3h later.
+///
+/// All the existing signals are RECEIVE-side or internal-data-plane. None of
+/// them observe whether RTSP media bytes are actually LEAVING toward the
+/// connected client. This watchdog adds exactly that one missing invariant:
+/// if no RTP buffers egress from the payloader (`pay0`) for this long while a
+/// client is connected (egress has started, i.e. egress_count > 0), tear down
+/// via the SAME EOS+exit path the error/back-pressure watchdogs use, so the
+/// factory callback rebuilds the pipeline on the next client connect.
+///
+/// Default 15s. Overridable at runtime via NEOLINK_RTSP_EGRESS_STALENESS_MS so
+/// the threshold can be tuned without a rebuild (read once at thread start).
+const RTSP_EGRESS_STALENESS_MS: u64 = 15_000;
+
+fn rtsp_egress_staleness_ms() -> u64 {
+    std::env::var("NEOLINK_RTSP_EGRESS_STALENESS_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(RTSP_EGRESS_STALENESS_MS)
+}
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -246,6 +289,62 @@ pub(super) async fn make_factory(
                             );
                         }
 
+                        // EGRESS liveness observation point (chosen: option (a),
+                        // a GStreamer BUFFER pad probe on the RTP payloader's
+                        // src pad). `pay0` (rtph264pay / rtph265pay) is the last
+                        // element in the bin WE build before the gst-rtsp-server
+                        // takes over and transmits to the client. A buffer
+                        // crossing pay0's src pad is the truest "RTP media is
+                        // leaving toward the client" signal we can observe
+                        // without reaching into the server-owned downstream
+                        // (rtpbin / transmit). Crucially this is DOWNSTREAM of
+                        // the appsrc: during the silent-wedge mode, push_buffer
+                        // into appsrc still "succeeds" (queued / dropped on
+                        // near-full) while pay0 output stalls because the RTSP
+                        // transmit side isn't pulling — exactly the gap every
+                        // existing (receive-side / send-error) signal misses.
+                        //
+                        // Why a probe and not the server's transmit callback:
+                        // gstreamer-rtsp-server 0.23 does not expose the
+                        // per-media data-transmit hook in a way we can attach
+                        // to the shared media here; the payloader src pad is the
+                        // closest observable boundary the crate gives us.
+                        let egress_count = Arc::new(AtomicU64::new(0));
+                        {
+                            let bin = element
+                                .clone()
+                                .dynamic_cast::<Bin>()
+                                .map_err(|_| anyhow!("pipeline element should be a bin"))?;
+                            if let Some(pay0) = bin.by_name("pay0") {
+                                if let Some(srcpad) = pay0.static_pad("src") {
+                                    let egress_count_probe = egress_count.clone();
+                                    let _ = srcpad.add_probe(
+                                        gstreamer::PadProbeType::BUFFER,
+                                        move |_pad, _info| {
+                                            egress_count_probe
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            gstreamer::PadProbeReturn::Ok
+                                        },
+                                    );
+                                    log::debug!(
+                                        "{name}::{stream}: attached RTSP egress probe on pay0 src pad"
+                                    );
+                                } else {
+                                    log::warn!(
+                                        "{name}::{stream}: pay0 has no src pad — egress watchdog disabled for this pipeline"
+                                    );
+                                }
+                            } else {
+                                // Unknown/splash pipelines have a different
+                                // payloader name; egress watchdog simply stays
+                                // disarmed (egress_count never advances, and the
+                                // monitor only fires once egress has STARTED).
+                                log::debug!(
+                                    "{name}::{stream}: no pay0 element — egress watchdog inactive (splash/unknown pipeline)"
+                                );
+                            }
+                        }
+
                         log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
                         // Send the pipeline back to the factory so it can start
                         let _ = reply.send(element);
@@ -253,6 +352,7 @@ pub(super) async fn make_factory(
                         // Run blocking code on a seperate thread
                         // This is not an async thread
                         let frame_pump_last_frame_at = last_frame_at.clone();
+                        let egress_count_pump = egress_count.clone();
                         std::thread::spawn(move || {
                             let mut aud_ts: u64 = 0;
                             let mut vid_ts: u64 = 0;
@@ -327,6 +427,33 @@ pub(super) async fn make_factory(
                             // in send_to_appsrc / send_to_sources.
                             let mut consecutive_backpressure: u32 = 0;
                             let mut eos_signaled = false;
+
+                            // EGRESS liveness state (silent-wedge net). See the
+                            // RTSP_EGRESS_STALENESS_MS doc-comment at the top of
+                            // this file for the full rationale. We watch the
+                            // pay0-src-pad buffer counter incremented by the pad
+                            // probe attached above. `egress_last_count` is the
+                            // value at the last advance; `egress_last_at` is the
+                            // epoch-ms of that advance. The clock only ARMS once
+                            // egress has actually started (count > 0) — an idle
+                            // pipeline with no connected/consuming client never
+                            // advances the counter and must NOT be torn down
+                            // (that would fight the Reset/stop_on_disconnect
+                            // teardown the existing patch relies on). Mirrors the
+                            // last_frame_at==0 guard in camthread.rs::frames_stale.
+                            let egress_staleness_ms = rtsp_egress_staleness_ms();
+                            let mut egress_last_count: u64 = 0;
+                            let mut egress_last_at: u64 = 0;
+                            // Epoch-ms at which the egress watchdog fired EOS, or
+                            // 0 if it hasn't. We track our OWN exit because the
+                            // silent-wedge mode keeps producing Ok(Sent) from
+                            // push_buffer (the appsrc accepts/drops frames), which
+                            // clears `eos_signaled` and never touches the error /
+                            // back-pressure counters — so we cannot lean on their
+                            // POST_EOS_GRACE exit. ~2.5s grace mirrors POST_EOS_GRACE
+                            // (50 frames @ 20fps) for the same teardown-race reason.
+                            let mut egress_eos_at: u64 = 0;
+                            const EGRESS_POST_EOS_GRACE_MS: u64 = 2_500;
                             // 100 consecutive errors at 20fps ≈ 5s of sustained
                             // failure. Transient state transitions clear in
                             // well under a second, so this threshold is
@@ -365,6 +492,63 @@ pub(super) async fn make_factory(
 
                             log::trace!("{name}::{stream}: Sending new frames");
                             while let Some(data) = media_rx.blocking_recv() {
+                                // EGRESS liveness check. Runs on every arriving
+                                // frame (the loop keeps spinning during the
+                                // silent wedge precisely because frames are
+                                // still ARRIVING — that's the failure mode).
+                                // Compare the pay0 egress counter against its
+                                // last-advanced value/time.
+                                {
+                                    let egress_now = egress_count_pump.load(Ordering::Relaxed);
+                                    let now_ms = now_epoch_ms();
+                                    if egress_eos_at != 0 {
+                                        // We already fired the egress EOS; wait
+                                        // out the grace window then exit. We own
+                                        // this exit (don't reuse the error /
+                                        // back-pressure POST_EOS_GRACE) because in
+                                        // the silent-wedge mode push_buffer keeps
+                                        // returning Ok(Sent), which clears
+                                        // `eos_signaled` and never advances those
+                                        // counters.
+                                        if now_ms.saturating_sub(egress_eos_at)
+                                            >= EGRESS_POST_EOS_GRACE_MS
+                                        {
+                                            log::info!(
+                                                "{name}::{stream}: exiting frame-pump thread after egress-stall EOS — factory callback will rebuild on next client connect"
+                                            );
+                                            break;
+                                        }
+                                    } else if egress_now > egress_last_count {
+                                        // Bytes are leaving toward the client —
+                                        // healthy. (Re)arm the clock.
+                                        egress_last_count = egress_now;
+                                        egress_last_at = now_ms;
+                                    } else if egress_last_at != 0
+                                        && now_ms.saturating_sub(egress_last_at)
+                                            > egress_staleness_ms
+                                    {
+                                        // Egress HAD started (clock armed) but
+                                        // has not advanced for longer than the
+                                        // staleness window while frames keep
+                                        // arriving: the RTSP consumer is wedged
+                                        // and no other signal will catch it.
+                                        // Trigger the SAME EOS path the error /
+                                        // back-pressure watchdogs use — we do NOT
+                                        // invent a parallel teardown.
+                                        log::warn!(
+                                            "{name}::{stream}: RTSP egress stalled (no bytes for {}s) — forcing pipeline rebuild",
+                                            egress_staleness_ms / 1000
+                                        );
+                                        if let Some(src) = vid_src.as_ref() {
+                                            let _ = src.end_of_stream();
+                                        }
+                                        if let Some(src) = aud_src.as_ref() {
+                                            let _ = src.end_of_stream();
+                                        }
+                                        eos_signaled = true;
+                                        egress_eos_at = now_ms;
+                                    }
+                                }
                                 // Stamp arrival BEFORE the push attempt: this
                                 // is the per-frame liveness signal the
                                 // camthread ping watchdog reads. Even if the
