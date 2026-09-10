@@ -270,6 +270,162 @@ fn rtsp_egress_staleness_ms() -> u64 {
         .unwrap_or(RTSP_EGRESS_STALENESS_MS)
 }
 
+// ---------------------------------------------------------------------------
+// Frame-pump failure state machine (refactor for test).
+//
+// These four counters + the EOS latch used to be `let mut` bindings inside
+// the frame-pump closure, with their thresholds declared as `const`s in the
+// same block. Nothing about the rules changed here — the bindings simply
+// moved into `PumpFailureState` so the fire / no-fire sides of every
+// threshold can be table-tested. The call sites keep their exact ordering:
+// terminal-detach is still checked before the power-of-two error log, EOS is
+// still fired at `== THRESHOLD`, and the exit is still `>= THRESHOLD +
+// POST_EOS_GRACE`.
+// ---------------------------------------------------------------------------
+
+/// 100 consecutive errors at 20fps ≈ 5s of sustained failure. Transient
+/// state transitions clear in well under a second, so this threshold is
+/// comfortably past "transient" territory. (a78b2da)
+const EOS_THRESHOLD: u32 = 100;
+
+/// Back-pressure tolerates more before firing — a slow consumer that briefly
+/// falls behind is normal. ~20s at 20fps. A genuinely stuck consumer holds
+/// Flushing indefinitely, so the distinction between "slow" and "wedged" is
+/// measured in seconds, not milliseconds. (cd4b78b)
+const BACKPRESSURE_EOS_THRESHOLD: u32 = 400;
+
+/// After EOS, give the pipeline ~2.5s to either recover (rare) or fully tear
+/// down before exiting. 50 frames at 20fps. If we exit IMMEDIATELY after EOS,
+/// we risk the new client's create_element callback racing with our thread
+/// teardown (the outer ClientMsg::NewClient handler is async; if it sees the
+/// rx side of media_rx still open briefly, the new thread spawns first).
+/// Empirically a ~2.5s grace is plenty. (cd4b78b)
+const POST_EOS_GRACE: u32 = 50;
+
+/// Terminal-detach fast-exit (fix 4/c34b277). "App source is closed" means
+/// the appsrc left the bin on a full unprepare and will NEVER recover for
+/// THIS pipeline, so it is TERMINAL, not transient: exit after a short
+/// confirmation window rather than waiting out EOS_THRESHOLD + POST_EOS_GRACE
+/// (150 pushes) while the doomed thread keeps its per-thread BufferPool
+/// sockets (~12/cycle) and its media_rx BC subscription alive.
+/// ~0.75s @20fps.
+const DETACHED_FAST_EXIT_THRESHOLD: u32 = 15;
+
+/// Grace the egress watchdog gives the pipeline between firing its own EOS
+/// and exiting the pump. Mirrors POST_EOS_GRACE (50 frames @20fps) for the
+/// same teardown-race reason; expressed in ms because the egress watchdog
+/// runs on empty ticks too, where there is no push to count. (cd4b78b)
+const EGRESS_POST_EOS_GRACE_MS: u64 = 2_500;
+
+/// What the frame-pump must do after one push attempt, as decided by
+/// [`PumpFailureState`]. Exactly one action per attempt: the thresholds are
+/// far enough apart that "fire EOS" and "exit after EOS" can never both be
+/// due on the same push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PumpAction {
+    /// Drop the frame and keep pumping (14e8129 — a single failed push must
+    /// NOT kill the pump).
+    Continue,
+    /// fix 4/c34b277: terminal detach confirmed — exit NOW, without EOS and
+    /// without waiting out the generic error window.
+    ExitDetached,
+    /// a78b2da: EOS_THRESHOLD consecutive errors — EOS the appsrcs so the
+    /// client disconnects and the factory rebuilds.
+    SignalEosErrors,
+    /// a78b2da + cd4b78b: the error EOS has been fired and its grace window
+    /// has elapsed — exit so this doomed thread cannot become a zombie.
+    ExitAfterErrorEos,
+    /// cd4b78b: BACKPRESSURE_EOS_THRESHOLD consecutive Flushing pushes — the
+    /// consumer is wedged; EOS to force a rebuild.
+    SignalEosBackPressure,
+    /// cd4b78b: the back-pressure EOS has been fired and its grace window has
+    /// elapsed — exit.
+    ExitAfterBackPressureEos,
+}
+
+/// The frame-pump's consecutive-failure counters and one-shot EOS latch.
+///
+/// One `observe` call per push attempt. Empty ticks (fix 13) must NOT touch
+/// this: ticks can neither advance nor reset any counter.
+#[derive(Debug, Default)]
+struct PumpFailureState {
+    consecutive_errors: u32,
+    consecutive_backpressure: u32,
+    consecutive_detached: u32,
+    eos_signaled: bool,
+}
+
+impl PumpFailureState {
+    /// A push succeeded. Returns the pre-reset (errors, back-pressure) counts
+    /// for the two "recovered after N" log lines, then clears everything —
+    /// including the EOS latch, so a later cascade can fire EOS again.
+    fn on_sent(&mut self) -> (u32, u32) {
+        let prior = (self.consecutive_errors, self.consecutive_backpressure);
+        self.consecutive_errors = 0;
+        self.consecutive_backpressure = 0;
+        self.consecutive_detached = 0;
+        self.eos_signaled = false;
+        prior
+    }
+
+    /// The push succeeded at the API level but the appsrc queue is full
+    /// (push_buffer returned Flushing) — the RTSP consumer is not draining.
+    fn on_backpressure(&mut self) -> PumpAction {
+        self.consecutive_backpressure += 1;
+        if self.consecutive_backpressure == BACKPRESSURE_EOS_THRESHOLD && !self.eos_signaled {
+            self.eos_signaled = true;
+            return PumpAction::SignalEosBackPressure;
+        }
+        if self.eos_signaled
+            && self.consecutive_backpressure >= BACKPRESSURE_EOS_THRESHOLD + POST_EOS_GRACE
+        {
+            return PumpAction::ExitAfterBackPressureEos;
+        }
+        PumpAction::Continue
+    }
+
+    /// The push returned Err. `detached` is the fix 4 terminal condition
+    /// (check_live's "App source is closed"); any non-detached error resets
+    /// that sub-run, exactly as the inline code did.
+    fn on_error(&mut self, detached: bool) -> PumpAction {
+        self.consecutive_errors += 1;
+        if detached {
+            self.consecutive_detached += 1;
+            if self.consecutive_detached >= DETACHED_FAST_EXIT_THRESHOLD {
+                return PumpAction::ExitDetached;
+            }
+        } else {
+            self.consecutive_detached = 0;
+        }
+        if self.consecutive_errors == EOS_THRESHOLD && !self.eos_signaled {
+            self.eos_signaled = true;
+            return PumpAction::SignalEosErrors;
+        }
+        if self.eos_signaled && self.consecutive_errors >= EOS_THRESHOLD + POST_EOS_GRACE {
+            return PumpAction::ExitAfterErrorEos;
+        }
+        PumpAction::Continue
+    }
+
+    /// The egress watchdog fired EOS on its own. Latch it so the error /
+    /// back-pressure paths do not fire a second EOS for the same cascade.
+    fn mark_eos_signaled(&mut self) {
+        self.eos_signaled = true;
+    }
+
+    fn consecutive_errors(&self) -> u32 {
+        self.consecutive_errors
+    }
+}
+
+/// True when the egress watchdog's own post-EOS grace window has elapsed and
+/// the pump must exit. `egress_eos_at == 0` means the watchdog has not fired,
+/// so it never elapses. Split out from the pump loop so the fire / no-fire
+/// sides of EGRESS_POST_EOS_GRACE_MS are testable without a pipeline.
+fn egress_eos_grace_elapsed(egress_eos_at: u64, now_ms: u64) -> bool {
+    egress_eos_at != 0 && now_ms.saturating_sub(egress_eos_at) >= EGRESS_POST_EOS_GRACE_MS
+}
+
 #[derive(Clone, Debug)]
 pub enum AudioType {
     Aac,
@@ -797,7 +953,13 @@ pub(super) async fn make_factory(
                             // stream stays dead until segment-watchdog
                             // (external) bounces neolink — same fallback as
                             // before, no regression.
-                            let mut consecutive_errors: u32 = 0;
+                            // consecutive_errors / consecutive_backpressure /
+                            // consecutive_detached + the one-shot eos_signaled
+                            // latch, and their thresholds, now live in
+                            // PumpFailureState (see its doc-comment). Behaviour
+                            // is unchanged; the move exists so the fire and
+                            // no-fire sides of each threshold are table-testable.
+                            //
                             // Sibling counter for sustained back-pressure
                             // (push_buffer returning Flushing). Unlike
                             // consecutive_errors, the push call itself
@@ -812,8 +974,7 @@ pub(super) async fn make_factory(
                             // it lacks a socket -timeout), no client churn,
                             // no factory rebuild. See `SendOutcome` plumbing
                             // in send_to_appsrc / send_to_sources.
-                            let mut consecutive_backpressure: u32 = 0;
-                            let mut eos_signaled = false;
+                            let mut pump_state = PumpFailureState::default();
 
                             // EGRESS liveness state (silent-wedge net). See the
                             // RTSP_EGRESS_STALENESS_MS doc-comment at the top of
@@ -840,12 +1001,6 @@ pub(super) async fn make_factory(
                             // POST_EOS_GRACE exit. ~2.5s grace mirrors POST_EOS_GRACE
                             // (50 frames @ 20fps) for the same teardown-race reason.
                             let mut egress_eos_at: u64 = 0;
-                            const EGRESS_POST_EOS_GRACE_MS: u64 = 2_500;
-                            // 100 consecutive errors at 20fps ≈ 5s of sustained
-                            // failure. Transient state transitions clear in
-                            // well under a second, so this threshold is
-                            // comfortably past "transient" territory.
-                            const EOS_THRESHOLD: u32 = 100;
                             // Terminal-detach fast-exit (fix 4, part 2).
                             //
                             // Under SuspendMode::None the shared pipeline is
@@ -873,25 +1028,6 @@ pub(super) async fn make_factory(
                             // `pools` (freeing the socketpairs) and `media_rx`
                             // (ending the BC start_video subscription) promptly.
                             // The factory rebuilds cleanly on the next connect.
-                            const DETACHED_FAST_EXIT_THRESHOLD: u32 = 15; // ~0.75s @20fps
-                            let mut consecutive_detached: u32 = 0;
-                            // Back-pressure tolerates more before firing —
-                            // a slow consumer that briefly falls behind is
-                            // normal. ~20s at 20fps. A genuinely stuck
-                            // consumer holds Flushing indefinitely, so the
-                            // distinction between "slow" and "wedged" is
-                            // measured in seconds, not milliseconds.
-                            const BACKPRESSURE_EOS_THRESHOLD: u32 = 400;
-                            // After EOS, give the pipeline ~2.5s to either
-                            // recover (rare) or fully tear down before exiting.
-                            // 50 frames at 20fps. If we exit IMMEDIATELY after
-                            // EOS, we risk the new client's create_element
-                            // callback racing with our thread teardown (the
-                            // outer ClientMsg::NewClient handler is async; if
-                            // it sees the rx side of media_rx still open
-                            // briefly, the new thread spawns first). Empirically
-                            // a ~2.5s grace is plenty.
-                            const POST_EOS_GRACE: u32 = 50;
                             // fix 15 — the fix 8 AUDIO-STALL exit that used
                             // to live here is REMOVED. It was speculative (one
                             // unconfirmed camera A incident 2026-07-03, never
@@ -998,9 +1134,7 @@ pub(super) async fn make_factory(
                                         // returning Ok(Sent), which clears
                                         // `eos_signaled` and never advances those
                                         // counters.
-                                        if now_ms.saturating_sub(egress_eos_at)
-                                            >= EGRESS_POST_EOS_GRACE_MS
-                                        {
+                                        if egress_eos_grace_elapsed(egress_eos_at, now_ms) {
                                             log::info!(
                                                 "{name}::{stream}: exiting frame-pump thread after egress-stall EOS — factory callback will rebuild on next client connect"
                                             );
@@ -1055,7 +1189,7 @@ pub(super) async fn make_factory(
                                         if let Some(src) = aud_src.as_ref() {
                                             let _ = src.end_of_stream();
                                         }
-                                        eos_signaled = true;
+                                        pump_state.mark_eos_signaled();
                                         egress_eos_at = now_ms;
                                     } else if egress_last_at != 0
                                         && playing
@@ -1096,7 +1230,7 @@ pub(super) async fn make_factory(
                                         if let Some(src) = aud_src.as_ref() {
                                             let _ = src.end_of_stream();
                                         }
-                                        eos_signaled = true;
+                                        pump_state.mark_eos_signaled();
                                         egress_eos_at = now_ms;
                                     }
                                     // fix 15: ORPHAN guard — see the
@@ -1157,6 +1291,8 @@ pub(super) async fn make_factory(
                                     &stream_config,
                                 ) {
                                     Ok(SendOutcome::Sent) => {
+                                        let (consecutive_errors, consecutive_backpressure) =
+                                            pump_state.on_sent();
                                         if consecutive_errors > 0 {
                                             log::info!(
                                                 "{name}::{stream}: send recovered after {consecutive_errors} errors"
@@ -1167,45 +1303,36 @@ pub(super) async fn make_factory(
                                                 "{name}::{stream}: back-pressure recovered after {consecutive_backpressure} blocked pushes"
                                             );
                                         }
-                                        consecutive_errors = 0;
-                                        consecutive_backpressure = 0;
-                                        consecutive_detached = 0;
-                                        eos_signaled = false;
                                     }
                                     Ok(SendOutcome::BackPressured) => {
-                                        consecutive_backpressure += 1;
                                         // Same Layer-2 recovery as the error
                                         // path: if back-pressure persists past
                                         // BACKPRESSURE_EOS_THRESHOLD, the
                                         // consumer is wedged. Signal EOS to
                                         // force client disconnect → factory
                                         // rebuild on next connect.
-                                        if consecutive_backpressure == BACKPRESSURE_EOS_THRESHOLD
-                                            && !eos_signaled
-                                        {
-                                            log::warn!(
-                                                "{name}::{stream}: {BACKPRESSURE_EOS_THRESHOLD} consecutive back-pressured pushes — consumer stuck, signaling EOS and exiting thread to force rebuild"
-                                            );
-                                            if let Some(src) = vid_src.as_ref() {
-                                                let _ = src.end_of_stream();
+                                        match pump_state.on_backpressure() {
+                                            PumpAction::SignalEosBackPressure => {
+                                                log::warn!(
+                                                    "{name}::{stream}: {BACKPRESSURE_EOS_THRESHOLD} consecutive back-pressured pushes — consumer stuck, signaling EOS and exiting thread to force rebuild"
+                                                );
+                                                if let Some(src) = vid_src.as_ref() {
+                                                    let _ = src.end_of_stream();
+                                                }
+                                                if let Some(src) = aud_src.as_ref() {
+                                                    let _ = src.end_of_stream();
+                                                }
                                             }
-                                            if let Some(src) = aud_src.as_ref() {
-                                                let _ = src.end_of_stream();
+                                            PumpAction::ExitAfterBackPressureEos => {
+                                                log::info!(
+                                                    "{name}::{stream}: exiting frame-pump thread after back-pressure EOS — factory callback will rebuild on next client connect"
+                                                );
+                                                break;
                                             }
-                                            eos_signaled = true;
-                                        }
-                                        if eos_signaled
-                                            && consecutive_backpressure
-                                                >= BACKPRESSURE_EOS_THRESHOLD + POST_EOS_GRACE
-                                        {
-                                            log::info!(
-                                                "{name}::{stream}: exiting frame-pump thread after back-pressure EOS — factory callback will rebuild on next client connect"
-                                            );
-                                            break;
+                                            _ => {}
                                         }
                                     }
                                     Err(e) => {
-                                        consecutive_errors += 1;
                                         // Terminal-detach fast path (fix 4):
                                         // "App source is closed" means the appsrc
                                         // left the bin (full unprepare) and will
@@ -1220,19 +1347,14 @@ pub(super) async fn make_factory(
                                         let detached = e
                                             .to_string()
                                             .contains("App source is closed");
-                                        if detached {
-                                            consecutive_detached += 1;
-                                            if consecutive_detached
-                                                >= DETACHED_FAST_EXIT_THRESHOLD
-                                            {
-                                                log::info!(
-                                                    "{name}::{stream}: appsrc detached (full unprepare) — fast-exiting frame-pump thread, freeing pools + BC subscription; factory rebuilds on next connect"
-                                                );
-                                                break;
-                                            }
-                                        } else {
-                                            consecutive_detached = 0;
+                                        let action = pump_state.on_error(detached);
+                                        if action == PumpAction::ExitDetached {
+                                            log::info!(
+                                                "{name}::{stream}: appsrc detached (full unprepare) — fast-exiting frame-pump thread, freeing pools + BC subscription; factory rebuilds on next connect"
+                                            );
+                                            break;
                                         }
+                                        let consecutive_errors = pump_state.consecutive_errors();
                                         // Log sparsely (powers of 2) to avoid
                                         // spamming tens of thousands of lines
                                         // during a sustained outage.
@@ -1241,41 +1363,38 @@ pub(super) async fn make_factory(
                                                 "{name}::{stream}: send error #{consecutive_errors} (dropping frame): {e:?}"
                                             );
                                         }
-                                        // Layer 2 self-recovery: at sustained
-                                        // failure, proactively EOS the appsrcs
-                                        // to force connected clients to
-                                        // disconnect+reconnect, which triggers
-                                        // a fresh factory callback → fresh
-                                        // pipeline → fresh thread.
-                                        if consecutive_errors == EOS_THRESHOLD
-                                            && !eos_signaled
-                                        {
-                                            log::warn!(
-                                                "{name}::{stream}: {EOS_THRESHOLD} consecutive errors — signaling EOS and exiting thread to force rebuild"
-                                            );
-                                            if let Some(src) = vid_src.as_ref() {
-                                                let _ = src.end_of_stream();
+                                        match action {
+                                            // Layer 2 self-recovery: at sustained
+                                            // failure, proactively EOS the appsrcs
+                                            // to force connected clients to
+                                            // disconnect+reconnect, which triggers
+                                            // a fresh factory callback → fresh
+                                            // pipeline → fresh thread.
+                                            PumpAction::SignalEosErrors => {
+                                                log::warn!(
+                                                    "{name}::{stream}: {EOS_THRESHOLD} consecutive errors — signaling EOS and exiting thread to force rebuild"
+                                                );
+                                                if let Some(src) = vid_src.as_ref() {
+                                                    let _ = src.end_of_stream();
+                                                }
+                                                if let Some(src) = aud_src.as_ref() {
+                                                    let _ = src.end_of_stream();
+                                                }
                                             }
-                                            if let Some(src) = aud_src.as_ref() {
-                                                let _ = src.end_of_stream();
+                                            // Exit after EOS+grace so this
+                                            // (now-doomed) thread doesn't
+                                            // accumulate as a zombie alongside
+                                            // the rebuilt thread. Dropping
+                                            // media_rx here closes the upstream
+                                            // BC subscription chain, freeing the
+                                            // camera-side start_video resources.
+                                            PumpAction::ExitAfterErrorEos => {
+                                                log::info!(
+                                                    "{name}::{stream}: exiting frame-pump thread after EOS — factory callback will rebuild on next client connect"
+                                                );
+                                                break;
                                             }
-                                            eos_signaled = true;
-                                        }
-                                        // Exit after EOS+grace so this
-                                        // (now-doomed) thread doesn't
-                                        // accumulate as a zombie alongside
-                                        // the rebuilt thread. Dropping
-                                        // media_rx here closes the upstream
-                                        // BC subscription chain, freeing the
-                                        // camera-side start_video resources.
-                                        if eos_signaled
-                                            && consecutive_errors
-                                                >= EOS_THRESHOLD + POST_EOS_GRACE
-                                        {
-                                            log::info!(
-                                                "{name}::{stream}: exiting frame-pump thread after EOS — factory callback will rebuild on next client connect"
-                                            );
-                                            break;
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -1312,7 +1431,10 @@ pub(super) async fn make_factory(
                             // no-op. Generation-guarded (see
                             // pipeline_generation above) so a stale pump can
                             // never kick a newer, healthy pipeline's clients.
-                            if pipeline_generation.load(Ordering::SeqCst) == my_generation {
+                            if crate::rtsp::gst::kick_generation_is_current(
+                                my_generation,
+                                pipeline_generation.load(Ordering::SeqCst),
+                            ) {
                                 rtsp.kick_clients_of_paths(
                                     paths,
                                     format!("{name}::{stream}"),
@@ -3060,5 +3182,786 @@ mod tests {
             gate_dead(Some(GATE_STALENESS_MS + 1_000), long_ago),
             "a truly dead camera must still be gated"
         );
+    }
+
+    // =====================================================================
+    // E — frame-pump resilience: 14e8129 / a78b2da / cd4b78b / c34b277 /
+    //     40fbd86 (fix 11) / 2542108
+    //
+    // The counters these fixes added lived as `let mut` bindings inside the
+    // frame-pump closure. They were moved verbatim into `PumpFailureState`
+    // (production refactor, no rule changed) so the FIRE and NO-FIRE side of
+    // every threshold can be table-tested. `oracle` below re-implements the
+    // pre-refactor inline block line-for-line and is fuzzed against the
+    // struct, so "no rule changed" is measured, not asserted.
+    // =====================================================================
+
+    /// Line-for-line copy of the pre-refactor inline counter block (HEAD~,
+    /// `src/rtsp/factory.rs` frame-pump `match send_to_sources(..)` arms).
+    /// Only the log calls and the appsrc EOS calls are elided; every counter
+    /// update, comparison operator and ordering is as it was.
+    #[derive(Default)]
+    struct InlinePumpOracle {
+        consecutive_errors: u32,
+        consecutive_backpressure: u32,
+        consecutive_detached: u32,
+        eos_signaled: bool,
+    }
+
+    impl InlinePumpOracle {
+        fn on_sent(&mut self) -> (u32, u32) {
+            let prior = (self.consecutive_errors, self.consecutive_backpressure);
+            self.consecutive_errors = 0;
+            self.consecutive_backpressure = 0;
+            self.consecutive_detached = 0;
+            self.eos_signaled = false;
+            prior
+        }
+
+        fn on_backpressure(&mut self) -> PumpAction {
+            self.consecutive_backpressure += 1;
+            let mut act = PumpAction::Continue;
+            if self.consecutive_backpressure == BACKPRESSURE_EOS_THRESHOLD && !self.eos_signaled {
+                self.eos_signaled = true;
+                act = PumpAction::SignalEosBackPressure;
+            }
+            if self.eos_signaled
+                && self.consecutive_backpressure >= BACKPRESSURE_EOS_THRESHOLD + POST_EOS_GRACE
+            {
+                act = PumpAction::ExitAfterBackPressureEos;
+            }
+            act
+        }
+
+        fn on_error(&mut self, detached: bool) -> PumpAction {
+            self.consecutive_errors += 1;
+            if detached {
+                self.consecutive_detached += 1;
+                if self.consecutive_detached >= DETACHED_FAST_EXIT_THRESHOLD {
+                    return PumpAction::ExitDetached;
+                }
+            } else {
+                self.consecutive_detached = 0;
+            }
+            let mut act = PumpAction::Continue;
+            if self.consecutive_errors == EOS_THRESHOLD && !self.eos_signaled {
+                self.eos_signaled = true;
+                act = PumpAction::SignalEosErrors;
+            }
+            if self.eos_signaled && self.consecutive_errors >= EOS_THRESHOLD + POST_EOS_GRACE {
+                act = PumpAction::ExitAfterErrorEos;
+            }
+            act
+        }
+    }
+
+    /// One push attempt as the pump sees it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Push {
+        Sent,
+        BackPressured,
+        Error { detached: bool },
+    }
+
+    /// Drive `PumpFailureState` over a push sequence, returning the action
+    /// for each push. Stops early on any Exit* (the real loop `break`s).
+    fn run_pump(pushes: impl IntoIterator<Item = Push>) -> Vec<PumpAction> {
+        let mut st = PumpFailureState::default();
+        let mut out = Vec::new();
+        for p in pushes {
+            let a = match p {
+                Push::Sent => {
+                    st.on_sent();
+                    PumpAction::Continue
+                }
+                Push::BackPressured => st.on_backpressure(),
+                Push::Error { detached } => st.on_error(detached),
+            };
+            out.push(a);
+            if matches!(
+                a,
+                PumpAction::ExitDetached
+                    | PumpAction::ExitAfterErrorEos
+                    | PumpAction::ExitAfterBackPressureEos
+            ) {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Index (1-based push number) of the first Exit* action, if any.
+    fn first_exit(actions: &[PumpAction]) -> Option<usize> {
+        actions.iter().position(|a| {
+            matches!(
+                a,
+                PumpAction::ExitDetached
+                    | PumpAction::ExitAfterErrorEos
+                    | PumpAction::ExitAfterBackPressureEos
+            )
+        })
+    }
+
+    /// The refactor is behaviour-preserving: over a deterministic
+    /// pseudo-random walk of every push outcome, the extracted struct and the
+    /// pre-refactor inline block agree on every single action.
+    #[test]
+    fn frame_pump_state_machine_matches_the_preexisting_inline_counters() {
+        const N: u32 = 400_000;
+        let mut st = PumpFailureState::default();
+        let mut or = InlinePumpOracle::default();
+        // xorshift32 — no dev-dependency, fully reproducible.
+        let mut x: u32 = 0x1234_5678;
+        let mut restarts = 0u32;
+        let mut compared = 0u32;
+        for _ in 0..N {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            // Weighted so long failure runs (the interesting region) happen:
+            // only 1-in-16 pushes succeed.
+            let push = match x % 16 {
+                0 => Push::Sent,
+                1..=6 => Push::Error { detached: false },
+                7..=11 => Push::Error { detached: true },
+                _ => Push::BackPressured,
+            };
+            let (a, b) = match push {
+                Push::Sent => {
+                    let a = st.on_sent();
+                    let b = or.on_sent();
+                    assert_eq!(a, b, "on_sent recovery counts diverged");
+                    (PumpAction::Continue, PumpAction::Continue)
+                }
+                Push::BackPressured => (st.on_backpressure(), or.on_backpressure()),
+                Push::Error { detached } => (st.on_error(detached), or.on_error(detached)),
+            };
+            compared += 1;
+            assert_eq!(a, b, "action diverged from the pre-refactor inline block");
+            if matches!(
+                a,
+                PumpAction::ExitDetached
+                    | PumpAction::ExitAfterErrorEos
+                    | PumpAction::ExitAfterBackPressureEos
+            ) {
+                st = PumpFailureState::default();
+                or = InlinePumpOracle::default();
+                restarts += 1;
+            }
+        }
+        eprintln!(
+            "[fp] refactor equivalence: {compared} push outcomes compared, \
+             {restarts} pump restarts, 0 divergences"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 14e8129 — a single failed push must not kill the pump
+    // ---------------------------------------------------------------------
+
+    /// PRE-FIX arm, lifted from 14e8129^ (`2542108`):
+    ///   let r = send_to_sources(..);
+    ///   if let Err(r) = &r { log::info!("Failed to send to source: {r:?}"); }
+    ///   r?;                      // <-- `?` on the closure's AnyResult: EXIT
+    /// i.e. the pump died on the FIRST error, whatever it was.
+    fn pre_14e8129_pump_survives(pushes: &[Push]) -> usize {
+        let mut survived = 0usize;
+        for p in pushes {
+            if matches!(p, Push::Error { .. }) {
+                return survived; // `r?` propagated — thread is gone
+            }
+            survived += 1;
+        }
+        survived
+    }
+
+    #[test]
+    fn fix_14e8129_transient_send_errors_do_not_kill_the_frame_pump() {
+        // The observed transient: a burst of "App source is closed" during a
+        // pipeline state transition, then the appsrc comes back.
+        const BURST: usize = 8;
+        let mut pushes: Vec<Push> = (0..BURST).map(|_| Push::Error { detached: true }).collect();
+        pushes.push(Push::Sent);
+        // ...and 1000 healthy frames afterwards.
+        pushes.extend(std::iter::repeat_n(Push::Sent, 1000));
+
+        let base_survived = pre_14e8129_pump_survives(&pushes);
+        let actions = run_pump(pushes.iter().copied());
+        let fixed_survived = first_exit(&actions).unwrap_or(actions.len());
+
+        eprintln!(
+            "[fp 14e8129] {BURST}-error transient then {} healthy frames: \
+             base pump survived {base_survived} pushes, fixed pump survived {fixed_survived}",
+            1001
+        );
+        assert_eq!(
+            base_survived, 0,
+            "pre-14e8129 arm must die on the FIRST error (it used `r?`)"
+        );
+        assert_eq!(
+            fixed_survived,
+            actions.len(),
+            "the fixed pump must survive the whole sequence"
+        );
+
+        // And the recovery is a full reset, not a partial one.
+        let mut st = PumpFailureState::default();
+        for _ in 0..(EOS_THRESHOLD - 1) {
+            assert_eq!(st.on_error(false), PumpAction::Continue);
+        }
+        assert_eq!(st.consecutive_errors(), EOS_THRESHOLD - 1);
+        st.on_sent();
+        assert_eq!(st.consecutive_errors(), 0, "a Sent must clear the run");
+    }
+
+    // ---------------------------------------------------------------------
+    // a78b2da — EOS at EOS_THRESHOLD consecutive errors (Layer 2)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn fix_a78b2da_eos_fires_at_the_threshold_and_not_one_short() {
+        // NO-FIRE: EOS_THRESHOLD-1 errors, then a success.
+        let mut short: Vec<Push> = std::iter::repeat_n(
+            Push::Error { detached: false },
+            (EOS_THRESHOLD - 1) as usize,
+        )
+        .collect();
+        short.push(Push::Sent);
+        let short_actions = run_pump(short);
+        let short_eos = short_actions
+            .iter()
+            .filter(|a| **a == PumpAction::SignalEosErrors)
+            .count();
+
+        // FIRE: EOS_THRESHOLD consecutive errors.
+        let long: Vec<Push> = std::iter::repeat_n(
+            Push::Error { detached: false },
+            (EOS_THRESHOLD + POST_EOS_GRACE) as usize,
+        )
+        .collect();
+        let long_actions = run_pump(long);
+        let eos_at = long_actions
+            .iter()
+            .position(|a| *a == PumpAction::SignalEosErrors)
+            .map(|i| i + 1);
+        let exit_at = first_exit(&long_actions).map(|i| i + 1);
+
+        eprintln!(
+            "[fp a78b2da] {} errors then a success -> {short_eos} EOS; \
+             {} consecutive errors -> EOS at push #{eos_at:?}, exit at push #{exit_at:?}",
+            EOS_THRESHOLD - 1,
+            EOS_THRESHOLD + POST_EOS_GRACE
+        );
+
+        assert_eq!(
+            short_eos,
+            0,
+            "{} errors followed by a success must NOT EOS",
+            EOS_THRESHOLD - 1
+        );
+        assert_eq!(eos_at, Some(EOS_THRESHOLD as usize), "EOS must fire at #100");
+        assert_eq!(
+            exit_at,
+            Some((EOS_THRESHOLD + POST_EOS_GRACE) as usize),
+            "exit must be EOS_THRESHOLD + POST_EOS_GRACE pushes in"
+        );
+
+        // One-shot per cascade: exactly one EOS, never a storm.
+        assert_eq!(
+            long_actions
+                .iter()
+                .filter(|a| **a == PumpAction::SignalEosErrors)
+                .count(),
+            1,
+            "EOS is one-shot per cascade (eos_signaled latch)"
+        );
+
+        // A success mid-cascade re-arms the protection for the next one.
+        let mut mixed: Vec<Push> = std::iter::repeat_n(
+            Push::Error { detached: false },
+            (EOS_THRESHOLD - 1) as usize,
+        )
+        .collect();
+        mixed.push(Push::Sent);
+        mixed.extend(std::iter::repeat_n(
+            Push::Error { detached: false },
+            EOS_THRESHOLD as usize,
+        ));
+        let mixed_actions = run_pump(mixed);
+        assert_eq!(
+            mixed_actions
+                .iter()
+                .filter(|a| **a == PumpAction::SignalEosErrors)
+                .count(),
+            1,
+            "the second cascade must still be able to EOS"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // cd4b78b — back-pressure watchdog (400 / +50 grace)
+    // ---------------------------------------------------------------------
+
+    /// PRE-FIX arm, lifted from cd4b78b^ (`681cc41`): `send_to_sources`
+    /// returned `AnyResult<()>`, so a full appsrc that made `push_buffer`
+    /// return Flushing was an `Ok(())` — indistinguishable from a healthy
+    /// send. It reset `consecutive_errors` and nothing ever fired.
+    fn pre_cd4b78b_backpressure_fires(_pushes: usize) -> bool {
+        false
+    }
+
+    #[test]
+    fn fix_cd4b78b_backpressure_watchdog_table() {
+        // NO-FIRE: one short of the threshold, then a drain.
+        let mut short: Vec<Push> = std::iter::repeat_n(
+            Push::BackPressured,
+            (BACKPRESSURE_EOS_THRESHOLD - 1) as usize,
+        )
+        .collect();
+        short.push(Push::Sent);
+        let short_actions = run_pump(short);
+        let short_fires = short_actions
+            .iter()
+            .filter(|a| **a == PumpAction::SignalEosBackPressure)
+            .count();
+
+        // FIRE: a consumer that never drains.
+        let long: Vec<Push> = std::iter::repeat_n(
+            Push::BackPressured,
+            (BACKPRESSURE_EOS_THRESHOLD + POST_EOS_GRACE + 10) as usize,
+        )
+        .collect();
+        let long_actions = run_pump(long);
+        let eos_at = long_actions
+            .iter()
+            .position(|a| *a == PumpAction::SignalEosBackPressure)
+            .map(|i| i + 1);
+        let exit_at = first_exit(&long_actions).map(|i| i + 1);
+
+        eprintln!(
+            "[fp cd4b78b] wedged consumer: base (pre-cd4b78b, Flushing looked like Ok) \
+             fired={} ; fixed EOS at blocked push #{eos_at:?}, exit at #{exit_at:?} \
+             (~{:.1}s @20fps); {} blocked pushes then a drain -> {short_fires} EOS",
+            pre_cd4b78b_backpressure_fires(long_actions.len()),
+            f64::from(BACKPRESSURE_EOS_THRESHOLD + POST_EOS_GRACE) / 20.0,
+            BACKPRESSURE_EOS_THRESHOLD - 1
+        );
+
+        assert!(
+            !pre_cd4b78b_backpressure_fires(long_actions.len()),
+            "pre-cd4b78b there was no back-pressure signal at all"
+        );
+        assert_eq!(short_fires, 0, "399 blocked pushes then a drain must not EOS");
+        assert_eq!(eos_at, Some(BACKPRESSURE_EOS_THRESHOLD as usize));
+        assert_eq!(
+            exit_at,
+            Some((BACKPRESSURE_EOS_THRESHOLD + POST_EOS_GRACE) as usize)
+        );
+        // Back-pressure must NOT be counted as an error (they are separate
+        // budgets — a slow consumer is not a dead appsrc).
+        let mut st = PumpFailureState::default();
+        for _ in 0..BACKPRESSURE_EOS_THRESHOLD {
+            st.on_backpressure();
+        }
+        assert_eq!(
+            st.consecutive_errors(),
+            0,
+            "back-pressure must not advance the error budget"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // c34b277 — terminal-detach fast exit (15 pushes, not 150)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn fix_c34b277_detached_fast_exit_table() {
+        let detached = Push::Error { detached: true };
+
+        // NO-FIRE: one short of the threshold, then a NON-detached error
+        // (e.g. a pool failure) resets the detach run.
+        let mut short: Vec<Push> =
+            std::iter::repeat_n(detached, (DETACHED_FAST_EXIT_THRESHOLD - 1) as usize).collect();
+        short.push(Push::Error { detached: false });
+        short.extend(std::iter::repeat_n(
+            detached,
+            (DETACHED_FAST_EXIT_THRESHOLD - 1) as usize,
+        ));
+        let short_actions = run_pump(short);
+        assert_eq!(
+            short_actions
+                .iter()
+                .filter(|a| **a == PumpAction::ExitDetached)
+                .count(),
+            0,
+            "a non-detached error must reset the detach run"
+        );
+
+        // FIRE.
+        let long: Vec<Push> = std::iter::repeat_n(detached, 400).collect();
+        let long_actions = run_pump(long);
+        let exit_at = long_actions
+            .iter()
+            .position(|a| *a == PumpAction::ExitDetached)
+            .map(|i| i + 1);
+
+        // PRE-FIX arm, from c34b277^ (`7fe3ef3`): no detach special-case at
+        // all, so a permanently-detached appsrc took the generic error path
+        // and the thread only exited at EOS_THRESHOLD + POST_EOS_GRACE.
+        let generic_exit = (EOS_THRESHOLD + POST_EOS_GRACE) as usize;
+        eprintln!(
+            "[fp c34b277] permanently-detached appsrc: base exits after {generic_exit} pushes \
+             (~{:.2}s @20fps), fixed exits after {exit_at:?} (~{:.2}s) — {:.1}x sooner",
+            generic_exit as f64 / 20.0,
+            exit_at.unwrap_or(0) as f64 / 20.0,
+            generic_exit as f64 / exit_at.unwrap_or(1) as f64
+        );
+        assert_eq!(exit_at, Some(DETACHED_FAST_EXIT_THRESHOLD as usize));
+        assert!(
+            exit_at.unwrap() * 5 < generic_exit,
+            "the fast path must be far shorter than the generic EOS window"
+        );
+        // The fast exit must NOT fire EOS first (the appsrc is gone; EOS on a
+        // detached appsrc is a no-op that only delays the teardown).
+        assert!(
+            !long_actions.contains(&PumpAction::SignalEosErrors),
+            "terminal detach exits without EOS"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // cd4b78b — egress watchdog post-EOS grace (EGRESS_POST_EOS_GRACE_MS)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn fix_egress_post_eos_grace_window_table() {
+        let fired_at = 1_000_000u64;
+        let table: [(u64, u64, bool, &str); 5] = [
+            (0, fired_at + 10_000, false, "watchdog never fired"),
+            (fired_at, fired_at, false, "same instant"),
+            (
+                fired_at,
+                fired_at + EGRESS_POST_EOS_GRACE_MS - 1,
+                false,
+                "1ms short of the grace",
+            ),
+            (
+                fired_at,
+                fired_at + EGRESS_POST_EOS_GRACE_MS,
+                true,
+                "exactly at the grace",
+            ),
+            (fired_at, fired_at - 5_000, false, "clock went backwards"),
+        ];
+        for (eos_at, now, want, why) in table {
+            assert_eq!(
+                egress_eos_grace_elapsed(eos_at, now),
+                want,
+                "egress_eos_grace_elapsed({eos_at}, {now}) — {why}"
+            );
+        }
+        eprintln!(
+            "[fp egress-grace] EGRESS_POST_EOS_GRACE_MS={EGRESS_POST_EOS_GRACE_MS} \
+             ({} frames @20fps, mirrors POST_EOS_GRACE={POST_EOS_GRACE}); \
+             5/5 table rows correct",
+            EGRESS_POST_EOS_GRACE_MS * 20 / 1000
+        );
+        assert_eq!(
+            EGRESS_POST_EOS_GRACE_MS * 20 / 1000,
+            u64::from(POST_EOS_GRACE),
+            "the ms grace must stay the frame grace expressed at 20fps"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // 2542108 — 10 MB video appsrc buffer
+    // ---------------------------------------------------------------------
+
+    /// Constant assertion only — `buffer_size` has no other observable
+    /// behaviour to simulate. The "what it buys" figure is arithmetic on the
+    /// asserted constant, not a measurement of a running pipeline.
+    #[test]
+    fn fix_2542108_video_appsrc_buffer_is_10mb() {
+        const TEN_MB: u32 = 10 * 1024 * 1024;
+        // PRE-FIX arm, lifted from 2542108^ (`1b66587`):
+        //     std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+        let pre = |bitrate: u32| std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32);
+        // Our 4K H.265 camera A stream runs ~6 Mbps; `bitrate` here is in kbps
+        // as reported by the camera's encode table.
+        for bitrate in [1024u32, 2048, 4096, 6144, 8192] {
+            assert_eq!(buffer_size(bitrate), TEN_MB, "bitrate={bitrate}");
+        }
+        let front_pre = pre(6144);
+        // A 4K I-frame at 6 Mbps / 20fps with a x8 I-frame ratio is ~240 KB.
+        const IFRAME_BYTES: u32 = 240 * 1024;
+        eprintln!(
+            "[fp 2542108] buffer_size(6144 kbps): base={front_pre} bytes \
+             ({:.1} x 240KB 4K I-frames), fixed={TEN_MB} bytes ({:.1} I-frames, \
+             {:.1}s at 6 Mbps) — {:.1}x larger",
+            f64::from(front_pre) / f64::from(IFRAME_BYTES),
+            f64::from(TEN_MB) / f64::from(IFRAME_BYTES),
+            f64::from(TEN_MB) * 8.0 / 6_000_000.0,
+            f64::from(TEN_MB) / f64::from(front_pre)
+        );
+        assert!(
+            front_pre < IFRAME_BYTES * 8,
+            "the pre-fix formula gave under 8 I-frames of headroom"
+        );
+        assert!(buffer_size(6144) > IFRAME_BYTES * 40);
+    }
+
+    // ---------------------------------------------------------------------
+    // 40fbd86 / fix 11 — leaky-downstream drops the OLDEST video frame
+    // ---------------------------------------------------------------------
+
+    fn test_stream_config() -> StreamConfig {
+        StreamConfig {
+            resolution: [3840, 2160],
+            bitrate: 6144,
+            fps: 20,
+            bitrate_table: vec![6144],
+            fps_table: vec![20],
+            vid_type: Some(VideoType::H264),
+            aud_type: Some(AudioType::Aac),
+        }
+    }
+
+    /// Push `frames` buffers of `frame_len` bytes (buffer N's every byte ==
+    /// N) into an appsrc whose queue nothing drains, then unblock and drain.
+    /// Returns the buffer ids that actually reached the sink, in order.
+    ///
+    /// `leaky` = the shipped config (fix 11: appsrc leaky-type=downstream,
+    /// `send_to_sources` always pushes).
+    /// `!leaky` = the PRE-FIX arm lifted from 40fbd86^ (`d90ce64`):
+    ///     let max = vid_src.max_bytes();
+    ///     if max > 0 && vid_src.current_level_bytes() >= max * 9 / 10 {
+    ///         log::debug!("Video buffer near capacity, dropping video frame");
+    ///     } else { send_to_appsrc(..) }
+    /// i.e. drop the NEWEST frame, keep the stale queue.
+    fn drain_under_pressure(
+        leaky: bool,
+        max_bytes: u64,
+        frame_len: usize,
+        frames: u8,
+    ) -> (Vec<u8>, u32) {
+        use gstreamer::prelude::*;
+        let pipeline = gstreamer::Pipeline::new();
+        let src = gstreamer::ElementFactory::make("appsrc")
+            .name("fp-vidsrc")
+            .build()
+            .expect("appsrc")
+            .dynamic_cast::<AppSrc>()
+            .expect("cast");
+        // Configured exactly as pipe_h264 configures the video appsrc.
+        src.set_is_live(false);
+        src.set_block(false);
+        if leaky {
+            src.set_property_from_str("leaky-type", "downstream");
+        }
+        src.set_min_latency(1000 / 20);
+        src.set_property("emit-signals", false);
+        src.set_max_bytes(max_bytes);
+        src.set_do_timestamp(false);
+        src.set_stream_type(AppStreamType::Stream);
+        src.set_caps(Some(&Caps::new_empty_simple("application/x-fp-leaky")));
+
+        let sink = gstreamer::ElementFactory::make("fakesink")
+            .name("fp-sink")
+            .build()
+            .expect("fakesink");
+        sink.set_property("sync", false);
+        sink.set_property("signal-handoffs", true);
+
+        let got: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let got2 = got.clone();
+        sink.connect("handoff", false, move |vals| {
+            let buf = vals[1].get::<gstreamer::Buffer>().expect("buffer");
+            if let Ok(map) = buf.map_readable() {
+                if let Some(b) = map.first() {
+                    got2.lock().expect("lock").push(*b);
+                }
+            }
+            None
+        });
+
+        let srcel = src.clone().upcast::<Element>();
+        pipeline.add_many([&srcel, &sink]).expect("add");
+        Element::link_many([&srcel, &sink]).expect("link");
+
+        // Block the appsrc src pad BEFORE the streaming task can run, so the
+        // queue is the only place buffers can go.
+        let pad = srcel.static_pad("src").expect("src pad");
+        let block = pad
+            .add_probe(
+                gstreamer::PadProbeType::BLOCK | gstreamer::PadProbeType::BUFFER,
+                |_, _| gstreamer::PadProbeReturn::Ok,
+            )
+            .expect("probe");
+
+        pipeline
+            .set_state(gstreamer::State::Playing)
+            .expect("to playing");
+
+        let mut skipped = 0u32;
+        for id in 0..frames {
+            if !leaky {
+                let max = src.max_bytes();
+                if max > 0 && src.current_level_bytes() >= max * 9 / 10 {
+                    skipped += 1;
+                    continue;
+                }
+            }
+            let mut buf = gstreamer::Buffer::with_size(frame_len).expect("alloc");
+            {
+                let bref = buf.get_mut().expect("mut");
+                let mut map = bref.map_writable().expect("map");
+                map.as_mut_slice().fill(id);
+            }
+            let _ = src.push_buffer(buf);
+        }
+
+        pad.remove_probe(block);
+        let _ = src.end_of_stream();
+        let bus = pipeline.bus().expect("bus");
+        let _ = bus.timed_pop_filtered(
+            gstreamer::ClockTime::from_seconds(10),
+            &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+        );
+        let _ = pipeline.set_state(gstreamer::State::Null);
+        let out = got.lock().expect("lock").clone();
+        (out, skipped)
+    }
+
+    #[test]
+    fn fix11_video_appsrc_leaky_downstream_drops_the_oldest_frame() {
+        if !gst_elements_ready(&["appsrc", "fakesink"]) {
+            eprintln!("SKIP fix11_video_appsrc_leaky_downstream_drops_the_oldest_frame: appsrc/fakesink not installed");
+            return;
+        }
+        const FRAME: usize = 4096;
+        const MAX_BYTES: u64 = 64 * 1024; // 16 frames fit
+        const FRAMES: u8 = 64;
+
+        let (fixed, _) = drain_under_pressure(true, MAX_BYTES, FRAME, FRAMES);
+        let (base, base_skipped) = drain_under_pressure(false, MAX_BYTES, FRAME, FRAMES);
+
+        let newest = FRAMES - 1;
+        let half = FRAMES / 2;
+        let fresh = |v: &[u8]| v.iter().filter(|b| **b >= half).count();
+        eprintln!(
+            "[fp fix 11] {FRAMES} x {FRAME}B frames into a {MAX_BYTES}B appsrc that nothing drains \n\
+             [fp fix 11] (a blocking pad probe holds the pipeline; up to ONE buffer can already \n\
+             [fp fix 11]  be in flight inside that probe, which is why frame 0 sometimes appears):\n\
+             [fp fix 11]   base  (drop-NEWEST, 40fbd86^ d90ce64): {} survived ({} of them newer than #{half}), \
+             {base_skipped} pushes skipped, seq={:?}\n\
+             [fp fix 11]   fixed (leaky-downstream, 40fbd86):     {} survived ({} newer than #{half}), seq={:?}\n\
+             [fp fix 11]   staleness of the freshest deliverable frame: base={} frames behind, fixed={} behind",
+            base.len(),
+            fresh(&base),
+            base,
+            fixed.len(),
+            fresh(&fixed),
+            fixed,
+            newest - base.iter().copied().max().expect("non-empty"),
+            newest - fixed.iter().copied().max().expect("non-empty")
+        );
+
+        assert!(
+            !base.contains(&newest),
+            "the pre-fix drop-NEWEST arm is supposed to lose the freshest frame; \
+             it kept {:?}",
+            base
+        );
+        assert_eq!(
+            base.first(),
+            Some(&0),
+            "the pre-fix arm keeps the OLDEST frames: {base:?}"
+        );
+        assert_eq!(fresh(&base), 0, "drop-NEWEST keeps nothing fresh: {base:?}");
+        assert!(
+            fixed.contains(&newest),
+            "leaky-downstream must keep the NEWEST frame; got {:?}",
+            fixed
+        );
+        assert!(
+            fresh(&fixed) >= 8,
+            "leaky-downstream must keep a queue-full of FRESH frames; got {:?}",
+            fixed
+        );
+        // The survivors end in a contiguous run up to the newest frame: the
+        // oldest were shed, not the freshest. (Ignore a possible single
+        // in-flight straggler at the head.)
+        let tail: Vec<u8> = fixed[fixed.len() - 8..].to_vec();
+        let want_tail: Vec<u8> = (newest - 7..=newest).collect();
+        assert_eq!(
+            tail, want_tail,
+            "the last 8 delivered buffers must be the last 8 pushed; got {fixed:?}"
+        );
+        let base_tail: Vec<u8> = base[base.len() - 8..].to_vec();
+        assert!(
+            base_tail.iter().all(|b| *b < half),
+            "the pre-fix arm's tail is stale, not fresh: {:?}",
+            base
+        );
+    }
+
+    #[test]
+    fn fix11_factory_sets_leaky_downstream_on_video_and_not_on_audio() {
+        if !gst_elements_ready(&["appsrc", "queue", "h264parse", "h265parse"]) {
+            eprintln!("SKIP fix11_factory_sets_leaky_downstream_on_video_and_not_on_audio: appsrc/queue/h264parse/h265parse not installed");
+            return;
+        }
+        let cfg = test_stream_config();
+        let leaky_of = |src: &AppSrc| {
+            src.property_value("leaky-type")
+                .serialize()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "<unserializable>".into())
+        };
+
+        let bin = gstreamer::Bin::with_name("fp-vid-bin").upcast::<Element>();
+        let vid264 = pipe_h264(&bin, &cfg).expect("pipe_h264").appsrc;
+        let bin = gstreamer::Bin::with_name("fp-vid265-bin").upcast::<Element>();
+        let vid265 = pipe_h265(&bin, &cfg).expect("pipe_h265").appsrc;
+
+        let v264 = leaky_of(&vid264);
+        let v265 = leaky_of(&vid265);
+
+        // Audio: whichever audio pipe this box can actually build.
+        let mut audio: Option<(&str, String)> = None;
+        let bin = gstreamer::Bin::with_name("fp-aud-aac-bin").upcast::<Element>();
+        if let Ok(l) = pipe_aac(&bin, &cfg) {
+            audio = Some(("aac", leaky_of(&l.appsrc)));
+        } else {
+            let bin = gstreamer::Bin::with_name("fp-aud-adpcm-bin").upcast::<Element>();
+            if let Ok(l) = pipe_adpcm(&bin, 1024, &cfg) {
+                audio = Some(("adpcm", leaky_of(&l.appsrc)));
+            }
+        }
+
+        eprintln!(
+            "[fp fix 11] configured leaky-type: h264 vidsrc={v264}, h265 vidsrc={v265}, \
+             audio={audio:?}; video max-bytes={} ({} MB)",
+            vid264.max_bytes(),
+            vid264.max_bytes() / (1024 * 1024)
+        );
+
+        assert_eq!(v264, "downstream", "h264 video appsrc must be leaky-downstream");
+        assert_eq!(v265, "downstream", "h265 video appsrc must be leaky-downstream");
+        assert_eq!(
+            vid264.max_bytes(),
+            u64::from(buffer_size(cfg.bitrate)),
+            "video appsrc max-bytes must be the 10 MB buffer_size (2542108)"
+        );
+        match audio {
+            Some((kind, leaky)) => assert_eq!(
+                leaky, "none",
+                "the {kind} audio appsrc must keep the drop-NEWEST skip (leaky-type=none)"
+            ),
+            None => eprintln!(
+                "SKIP (partial) audio leaky-type assertion: neither the aac nor the adpcm \
+                 pipeline could be built on this box"
+            ),
+        }
     }
 }
