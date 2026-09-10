@@ -3,6 +3,28 @@
 #                    Andrew King,
 #                    Miroslav Šedivý
 # SPDX-License-Identifier: AGPL-3.0-only
+#
+# ###########################################################################
+# TEST-ONLY CONTROL IMAGE -- NOT A DEPLOY TARGET.
+#
+# bookworm base with the STOCK, UNPATCHED libgstrtspserver 1.22.0-2 (i.e. the
+# local de-assert deb removed). It is the negative control for
+# iso-test/prove_upstream_gst.sh GATE A: same Rust source, only the C library
+# differs from Dockerfile (trixie / stock 1.26.2-1).
+#
+# To reproduce GATE A, first disable the Rust DESCRIBE liveness gate
+# (it masks the C layer) by raising both consts in src/rtsp/factory.rs to 24 h:
+#   NEVER_CONNECTED_GRACE_MS = 86_400_000
+#   GATE_STALENESS_MS        = 86_400_000
+# then build both images and run the harness:
+#   docker build -f Dockerfile.ab-bookworm-stock -t neolink:ab-nogate-bookworm-stock .
+#   docker build                                 -t neolink:ab-nogate-trixie .
+#   git checkout src/rtsp/factory.rs        # never ship the gate-off consts
+#   ./iso-test/prove_upstream_gst.sh a
+# Measured 2026-09-09: bookworm/1.22 SIGABRTed (rtsp-media.c:2766 assertion
+# failed: (FALSE)) after 115 attaches; trixie/1.26 survived 25,669 attaches
+# with 10,035 graceful "failed to obtain consistent rate" warnings.
+# ###########################################################################
 
 # ---------------------------------------------------------------------------
 # 2026-09-09 base moved bookworm -> trixie.
@@ -33,7 +55,7 @@
 # Base images pinned by tag + digest.
 # ---------------------------------------------------------------------------
 
-FROM docker.io/rust:slim-trixie@sha256:bce1476d4be4d78b83705bc5f428b86d640eeeea33e9dadafbc037b5703a53bf AS build
+FROM docker.io/rust:slim-bookworm@sha256:ebd900bae66fd508b466cef82d64a83a5fb34682e4c8b2797a42908bddc95a57 AS build
 ARG TARGETPLATFORM
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -71,7 +93,7 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
   fi
 
 # Create the release container. Match the base OS used to build
-FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 ARG TARGETPLATFORM
 ARG REPO
 ARG VERSION
@@ -82,13 +104,13 @@ LABEL repository="$REPO"
 LABEL version="$VERSION"
 LABEL maintainer="$OWNER"
 
-# bind9-dnsutils replaces bookworm's transitional `dnsutils` (dropped in trixie).
+# dnsutils replaces bookworm's transitional `dnsutils` (dropped in trixie).
 # hadolint ignore=DL3008
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         openssl \
-        bind9-dnsutils \
+        dnsutils \
         iputils-ping \
         ca-certificates \
         libgstrtspserver-1.0-0 \
@@ -101,14 +123,6 @@ RUN apt-get update && \
         gstreamer1.0-libav && \
     apt-get clean -y && rm -rf /var/lib/apt/lists/*
 
-# Guard: the runtime MUST be a stock gst-rtsp-server >= 1.24.9 (i.e. one that
-# carries MR !7731). Fail the build loudly if a future base regresses either
-# the version or the local-suffix cleanliness.
-RUN set -eu; \
-    v="$(dpkg-query -W -f='${Version}' libgstrtspserver-1.0-0)"; \
-    echo "libgstrtspserver-1.0-0 = $v"; \
-    case "$v" in *deassert*) echo "ERROR: patched deb present, expected stock" >&2; exit 1;; esac; \
-    dpkg --compare-versions "$v" ge 1.24.9 || { echo "ERROR: $v < 1.24.9 (missing MR !7731)" >&2; exit 1; }
 
 COPY --from=build \
   /usr/local/src/neolink/target/release/neolink \
