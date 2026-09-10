@@ -77,6 +77,14 @@ impl NeoCamThread {
 
         self.camera_watch.send_replace(Arc::downgrade(&camera));
 
+        // Fresh grace window on every (re)connect: reset the staleness clock to
+        // connection time so a slow-to-start camera (marginal WiFi link) gets a
+        // full FRAME_STALENESS_MS to deliver its first frame. Without this the
+        // watchdog inherits the pre-disconnect timestamp and re-trips within one
+        // ~5s tick, producing a tight connect→declare-dead→reconnect loop that
+        // never lets the camera re-establish its video stream.
+        self.last_frame_at.store(now_epoch_ms(), Ordering::Relaxed);
+
         let cancel_check = self.cancel.clone();
         let last_frame_at = self.last_frame_at.clone();
         let watchdog_name = name.clone();
