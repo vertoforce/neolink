@@ -71,6 +71,26 @@ const RTSP_EGRESS_STALENESS_MS: u64 = 15_000;
 /// gate in the loop.
 const PUMP_RECV_TICK_MS: u64 = 5_000;
 
+/// fix 14: DESCRIBE liveness gate — grace for the never-connected case.
+///
+/// `frames_stale` (camthread.rs) deliberately returns false while
+/// `last_frame_at == 0` (camera never connected since process start) so the
+/// camthread watchdog can't kill a camera that is still logging in. The
+/// DESCRIBE gate must NOT inherit that exemption: a camera that has never
+/// connected (powered-off `camera A`, 2026-08-14) would otherwise be served the
+/// build_unknown splash pipeline — 500 videotestsrc buffers then EOS —
+/// feeding placeholder frames into frigate recordings AND leaving behind the
+/// post-EOS cached shared media whose complete-but-dataless sender streams
+/// trip the gst-rtsp-server get_rates SIGABRT on the next PLAY (the ~30s
+/// prod crash cadence: 20s splash + reconnect). Instead: once the factory is
+/// older than this grace, a still-never-connected camera fast-fails its
+/// DESCRIBEs. 15s is enough for healthy boot-time BC login (measured 3-6s,
+/// even on marginal WiFi — and camthread stores last_frame_at=now on connect
+/// SUCCESS, which reroutes the gate to frames_stale well before first frame)
+/// while sitting BELOW the 20s splash EOS so a dead camera can never
+/// complete a splash cycle once the gate is armed.
+const NEVER_CONNECTED_GRACE_MS: u64 = 15_000;
+
 /// fix 13: outcome of one bounded wait on the camera frame channel.
 enum PumpRecv {
     Frame(BcMedia),
@@ -228,11 +248,98 @@ impl StreamConfig {
     }
 }
 
+/// fix 14: staleness threshold for the DESCRIBE gate's connected-then-died
+/// branch. Deliberately 2x the camthread FRAME_STALENESS_MS (reference the
+/// canonical const, don't restate the literal): an idle-but-healthy camera
+/// (zero consumers => zero frames) cycles its BC connection every
+/// ~FRAME_STALENESS_MS by design (fix 13 ping-success staleness arm), and
+/// last_frame_at is only re-stored ~4s AFTER each reconnect (the two 2s
+/// post-login settle sleeps in camthread::run_camera) — so idle-cycle
+/// staleness legitimately peaks near FRAME_STALENESS_MS + ~5s. MEASURED
+/// (iso test 2026-08-15): a gate that reused FRAME_STALENESS_MS directly
+/// false-failed a healthy idle camera C's DESCRIBE in that post-reconnect
+/// window — a chicken-and-egg lockout risk (the DESCRIBE it bounces is the
+/// consumer whose frames would prove the camera alive). At 2x, that whole
+/// healthy regime sits far below the threshold; only a camera whose
+/// reconnects are FAILING (truly dead — reconnect success would re-store
+/// last_frame_at) lets staleness grow past it.
+const GATE_STALENESS_MS: u64 = 2 * crate::common::FRAME_STALENESS_MS;
+
+/// fix 14: shared DESCRIBE liveness predicate for both factories. Two dead
+/// states:
+///   1. connected-then-died: no frame AND no successful (re)connect for
+///      >GATE_STALENESS_MS (see that const for why this is 2x the camthread
+///      watchdog's threshold);
+///   2. never-connected (last_frame_at == 0, e.g. powered-off camera at
+///      process start): dead once the factory is older than
+///      NEVER_CONNECTED_GRACE_MS (see that const).
+/// Inert for healthy cameras: camthread stores last_frame_at=now on every
+/// connect success (fix 5) and the frame-pump refreshes it on every push.
+///
+/// KNOWN NOISE (assessed safe, deliberate): each gated DESCRIBE returns
+/// Ok(None) -> the create_element vfunc returns NULL, and the gstreamer-rs
+/// binding glue calls g_object_force_floating on that NULL before handing
+/// it to C, printing one `GLib-GObject-CRITICAL ** g_object_force_floating:
+/// assertion 'G_IS_OBJECT (object)' failed` per gated attach (~6/min while
+/// a camera is down, zero when healthy). Why this is safe and kept:
+/// - the C caller explicitly handles the NULL (rtsp-media-factory.c:1844
+///   `if (element == NULL) goto no_element` -> NULL media -> the request
+///   fails cleanly; measured live: clients get 400 and retry, process
+///   RestartCount stays 0);
+/// - glib assertion guards just log and return early — inert unless
+///   G_DEBUG=fatal-criticals, which is set nowhere in this deployment
+///   (compose env, Dockerfile, entrypoint all checked 2026-08-15);
+/// - this is the SAME mechanism the fix 6 build-timeout path has used
+///   since 2026-06-18 (same CRITICAL signature, hundreds/day during July
+///   incidents in Loki, zero associated crashes);
+/// - the alternative — returning a streamless element so the pointer is
+///   non-NULL — hands gst-rtsp-server a media object its prepare/SDP path
+///   was not designed for (0 streams; PREPARED transition depends on
+///   receive-only/bus-message details), risking a blocked client watch,
+///   i.e. trading bounded log noise for a potential all-client wedge.
+fn liveness_gate_dead(
+    last_frame_at: &Arc<AtomicU64>,
+    armed_at: &std::time::Instant,
+) -> bool {
+    let last = last_frame_at.load(Ordering::Relaxed);
+    if last == 0 {
+        armed_at.elapsed() >= Duration::from_millis(NEVER_CONNECTED_GRACE_MS)
+    } else {
+        crate::common::now_epoch_ms().saturating_sub(last) > GATE_STALENESS_MS
+    }
+}
+
 pub(super) async fn make_dummy_factory(
+    camera: &NeoInstance,
     use_splash: bool,
     pattern: String,
 ) -> AnyResult<NeoMediaFactory> {
+    // fix 14 — the dummy factory is the factory actually mounted for a
+    // camera that has NEVER connected (mod.rs mounts it at startup "so the
+    // URL will not return 404 while waiting for configuration"; the real
+    // make_factory only replaces it once the camera's stream info arrives,
+    // which requires a successful BC login). For a powered-off camera the
+    // dummy therefore serves EVERY client, and its build_unknown splash
+    // (videotestsrc, 500 buffers = 20s, then EOS) is the crash vector: after
+    // EOS the cached shared media's streams are complete senders that never
+    // pass data again, and a subsequent client PLAY hits the g_assert in
+    // gst-rtsp-server rtsp-media.c:2766 get_rates -> SIGABRT of the whole
+    // process (2026-08-14 storm, ~130 crashes/hour — cadence ~30s = 20s
+    // splash + client reconnect). Gate it exactly like make_factory's
+    // callback: once the camera is provably dead, fail the DESCRIBE in
+    // microseconds instead of serving the splash. Healthy boot is
+    // unaffected: the dummy only splashes inside NEVER_CONNECTED_GRACE_MS,
+    // and a camera that connects flips the gate open via last_frame_at.
+    let gate_last_frame_at = camera.last_frame_at().await?;
+    let gate_name = camera.config().await?.borrow().name.clone();
+    let gate_armed_at = std::time::Instant::now();
     NeoMediaFactory::new_with_callback(move |element| {
+        if liveness_gate_dead(&gate_last_frame_at, &gate_armed_at) {
+            log::info!(
+                "create_element: {gate_name} (dummy factory): camera not delivering frames (never-connected or stale >{GATE_STALENESS_MS}ms) — fast-failing DESCRIBE instead of serving splash (fix 14 liveness gate)"
+            );
+            return Ok(None);
+        }
         clear_bin(&element)?;
         if !use_splash {
             Ok(None)
@@ -262,6 +369,12 @@ pub(super) async fn make_factory(
     paths: Arc<Vec<String>>,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
     let (client_tx, mut client_rx) = mpsc(100);
+    // fix 14: clones for the create_element DESCRIBE liveness gate below.
+    // Fetched here (async context) because the factory callback runs on the
+    // shared glib main-loop thread where we can't await.
+    let gate_last_frame_at = camera.last_frame_at().await?;
+    let gate_name = camera.config().await?.borrow().name.clone();
+    let gate_armed_at = std::time::Instant::now();
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
         let name = camera.config().await?.borrow().name.clone();
@@ -1019,6 +1132,24 @@ pub(super) async fn make_factory(
 
     // Now setup the factory
     let factory = NeoMediaFactory::new_with_callback(move |element| {
+        // fix 14 — DESCRIBE liveness gate. A dead camera must fail the
+        // DESCRIBE in microseconds, not occupy the SHARED glib main-loop
+        // thread building a pipeline that can never stream — and, worse, can
+        // leave behind the post-EOS splash media whose complete-but-dataless
+        // sender streams tripped the gst-rtsp-server get_rates g_assert
+        // SIGABRT on the next PLAY (2026-08-14 storm, ~130 whole-process
+        // crashes/hour; the C-side de-assert in
+        // docker/gst-rtsp-media-deassert.patch is the backstop, this gate
+        // closes the window that reaches it). Dead-state predicate shared
+        // with make_dummy_factory — see liveness_gate_dead. Ok(None) -> gst
+        // fails this DESCRIBE cleanly; go2rtc just retries until the camera
+        // is back.
+        if liveness_gate_dead(&gate_last_frame_at, &gate_armed_at) {
+            log::info!(
+                "create_element: {gate_name}::{stream}: camera not delivering frames (never-connected or stale >{GATE_STALENESS_MS}ms) — fast-failing DESCRIBE (fix 14 liveness gate)"
+            );
+            return Ok(None);
+        }
         let (reply, new_element) = std::sync::mpsc::sync_channel(1);
         client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
 

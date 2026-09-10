@@ -329,7 +329,11 @@ async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
                 };
 
                 // Create the dummy factory
-                let dummy_factory = make_dummy_factory(use_splash, splash_pattern).await?;
+                // fix 14: pass the camera so the dummy factory can apply the
+                // DESCRIBE liveness gate — for a never-connected camera THIS
+                // factory (not make_factory's) serves every client, and its
+                // post-EOS splash media is what tripped the get_rates SIGABRT.
+                let dummy_factory = make_dummy_factory(&camera, use_splash, splash_pattern).await?;
                 dummy_factory.add_permitted_roles(&permitted_users);
                 let mut supported_streams_1 = supported_streams.clone();
                 let mut supported_streams_2 = supported_streams.clone();

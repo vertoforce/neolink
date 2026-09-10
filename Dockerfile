@@ -45,6 +45,44 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
     cargo build --release; \
   fi
 
+# ---------------------------------------------------------------------------
+# local patch: gst-rtsp-server 1.22 (de-assert gst_rtsp_media_get_rates).
+#
+# A dead camera can leave a stream in "complete sender but no data ever
+# flowed" state; every client PLAY then hits g_assert(FALSE) in
+# rtsp-media.c:2766 -> SIGABRT of the WHOLE process (~130 crashes/hour on
+# 2026-08-14, all cameras down each time). The C library is Debian's, not
+# neolink's Rust, so we rebuild the bookworm package with a 3-site patch
+# routing the asserts onto the function's existing graceful result=FALSE
+# path (caller logs "failed to obtain consistent rate", errors that one
+# client's request). See docker/gst-rtsp-media-deassert.patch.
+#
+# The built .deb (version-suffixed +deassert.1) is installed over the distro
+# lib in the runtime stage below. The Rust build stage intentionally keeps
+# the UNPATCHED -dev package: the patch changes no headers/ABI, only .so
+# internals.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS gstrtsp-patched
+ENV DEBIAN_FRONTEND=noninteractive
+# hadolint ignore=DL3008
+RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential devscripts dpkg-dev quilt fakeroot && \
+    apt-get build-dep -y gst-rtsp-server1.0
+WORKDIR /build
+COPY docker/gst-rtsp-media-deassert.patch /build/
+RUN apt-get source gst-rtsp-server1.0 && \
+    cd gst-rtsp-server1.0-*/ && \
+    patch -p1 --fuzz=0 < /build/gst-rtsp-media-deassert.patch && \
+    # patch applied cleanly or the build dies here; belt-and-braces: the
+    # three de-assert marker comments must be present in the patched source
+    test "$(grep -c 'de-assert' gst/rtsp-server/rtsp-media.c)" -ge 3 && \
+    DEBEMAIL=deassert@local DEBFULLNAME="neolink deassert" \
+      dch --local "+deassert." "de-assert gst_rtsp_media_get_rates: dead-camera PLAY must not SIGABRT the process" && \
+    DEB_BUILD_OPTIONS=nocheck dpkg-buildpackage -b -uc -us && \
+    ls -l /build/libgstrtspserver-1.0-0_*.deb
+
 # Create the release container. Match the base OS used to build
 FROM debian:bookworm-slim
 ARG TARGETPLATFORM
@@ -74,6 +112,15 @@ RUN apt-get update && \
         gstreamer1.0-plugins-bad \
         gstreamer1.0-libav && \
     apt-get clean -y && rm -rf /var/lib/apt/lists/*
+
+# install the de-asserted libgstrtspserver over the distro one
+# (same upstream version, +deassert.1 local suffix -> dpkg treats it as an
+# upgrade; hold so a hypothetical apt upgrade can't silently revert it).
+COPY --from=gstrtsp-patched /build/libgstrtspserver-1.0-0_*.deb /tmp/
+RUN dpkg -i /tmp/libgstrtspserver-1.0-0_*.deb && \
+    rm -f /tmp/libgstrtspserver-1.0-0_*.deb && \
+    apt-mark hold libgstrtspserver-1.0-0 && \
+    dpkg -s libgstrtspserver-1.0-0 | grep -i '^Version:.*deassert'
 
 COPY --from=build \
   /usr/local/src/neolink/target/release/neolink \

@@ -1,0 +1,56 @@
+Description: de-assert gst_rtsp_media_get_rates (neolink fork local patch)
+ A stream that reached "complete sender" state (SETUP done) but through which
+ no data ever flowed (dead camera: appsrc never pushed, no segment event, no
+ rate info) hits g_assert(FALSE) at rtsp-media.c:2766 when a client's PLAY is
+ processed, SIGABRTing the entire process and killing every camera it serves
+ (measured 2026-08-14: ~130 crashes/hour with one powered-off camera). The
+ function already has a graceful result=FALSE path -- the caller logs "failed
+ to obtain consistent rate" and errors only that one request -- so the asserts
+ are gratuitous in production. This patch routes all three assert sites onto
+ that existing failure path. Behavior for healthy streams is unchanged.
+Author: neolink local fork
+Forwarded: no (upstream gst-rtsp-server still carries the asserts; the
+ complete-but-frameless-sender state is unreported upstream as of 2026-08-14)
+--- a/gst/rtsp-server/rtsp-media.c
++++ b/gst/rtsp-server/rtsp-media.c
+@@ -2743,7 +2743,13 @@
+ 
+   g_mutex_lock (&priv->lock);
+ 
+-  g_assert (priv->streams->len > 0);
++  /* de-assert: no streams is unexpected but must not abort the process --
++   * report failure to the caller instead. */
++  if (priv->streams->len == 0) {
++    GST_WARNING_OBJECT (media, "no streams, cannot get rates (de-assert)");
++    g_mutex_unlock (&priv->lock);
++    return FALSE;
++  }
+   for (i = 0; i < priv->streams->len; i++) {
+     stream = g_ptr_array_index (priv->streams, i);
+     if (gst_rtsp_stream_is_complete (stream)
+@@ -2756,14 +2762,23 @@
+         } else {
+           if (save_rate != *rate || save_applied_rate != *applied_rate) {
+             /* diffrent rate or applied_rate, weird */
+-            g_assert (FALSE);
++            /* de-assert: inconsistent rates must not abort the
++             * process; take the existing graceful failure path. */
++            GST_WARNING_OBJECT (media,
++                "inconsistent rate across streams (de-assert)");
+             result = FALSE;
+             break;
+           }
+         }
+       } else {
+         /* complete stream withot rate and applied_rate, weird */
+-        g_assert (FALSE);
++        /* de-assert: a complete sender stream that never passed
++         * data (dead camera) has no rate info; this used to SIGABRT the
++         * whole process on every client PLAY. Fail the request instead --
++         * the caller logs "failed to obtain consistent rate" and errors
++         * only this client's request. */
++        GST_WARNING_OBJECT (media,
++            "complete sender has no rate info (de-assert)");
+         result = FALSE;
+         break;
+       }
