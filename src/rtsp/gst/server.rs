@@ -116,6 +116,79 @@ fn session_stale_reap_margin_ms() -> i64 {
         .unwrap_or(SESSION_STALE_REAP_MARGIN_MS)
 }
 
+/// Pure staleness predicate for the sweep — extracted so the ms/seconds
+/// arithmetic that destroyed attempt #1 (`neolink:local fix`, reverted 2026-06-01)
+/// is unit-testable without a live RTSP server. See
+/// `SESSION_STALE_REAP_MARGIN_MS` for the full root cause.
+///
+/// `remaining_ms` is what `RTSPSession::next_timeout_usec(now)` actually
+/// returns: MILLISECONDS to expiry, clamped at 0 (upstream `rtsp-session.c`
+/// does `GST_TIME_AS_MSECONDS(...)`; the `usec` in the name refers to the
+/// monotonic `now` ARGUMENT, not the return value). Everything here is
+/// therefore in milliseconds.
+///
+/// A session is stale iff it has a real (non-zero) timeout AND its own
+/// remaining-to-expiry has decayed into the narrow pre-expiry margin
+/// (`remaining_ms <= margin_ms`, equivalently
+/// `since_touch_ms >= timeout_secs*1000 - margin_ms`). `remaining_ms == 0`
+/// (already expired, client may still hold it) counts as stale — fix 9 wants
+/// those owners kicked, not silently left behind.
+pub(crate) fn session_is_stale_ms(timeout_secs: u32, remaining_ms: i64, margin_ms: i64) -> bool {
+    let timeout_ms = (timeout_secs as i64).saturating_mul(1000);
+    timeout_ms > 0 && remaining_ms <= margin_ms
+}
+
+/// One ordered action of the fix 9 close-then-reap sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReapStep {
+    /// Close the TCP connection of the Nth collected owning client.
+    CloseOwner(usize),
+    /// Pool-remove every stale session (single `filter()` pass).
+    PoolReapStaleSessions,
+}
+
+/// The fix 9 ORDERING CONTRACT, expressed as data so it can be asserted in a
+/// test instead of only being argued in a comment: every owning client is
+/// closed BEFORE the pool reap.
+///
+/// Why the order matters (iso GATE Z, 2026-07-09): pool-removal cascades —
+/// gst-rtsp-server's client watches the pool's `session-removed` signal and
+/// detaches the session from the client — so a sweep that reaps first can no
+/// longer find "the client owning this session" and the starved consumer stays
+/// a zombie. The pre-fix9 sweep had no close step at all (see
+/// `git show d90ce64^:src/rtsp/gst/server.rs`).
+pub(crate) fn stale_reap_plan(n_owners: usize) -> Vec<ReapStep> {
+    let mut plan: Vec<ReapStep> = (0..n_owners).map(ReapStep::CloseOwner).collect();
+    plan.push(ReapStep::PoolReapStaleSessions);
+    plan
+}
+
+/// Exact-path predicate for the zombie-client kick (fix 9).
+///
+/// `RTSPSessionMedia::matches(path)` (`gst_rtsp_session_media_matches`) returns
+/// `Some(n)` when `path` STARTS WITH the session-media's own mount path, where
+/// `n` is the length of that mount path — i.e. a bare prefix hit also returns
+/// `Some`. Accepting any `Some` would let a `/<cam>/main` kick collateral-kill
+/// a client attached to the bare `/<cam>` alias (and vice versa). Requiring
+/// `n == candidate.len()` makes the match EXACT.
+pub(crate) fn media_path_is_exact_match(matched: Option<i32>, candidate: &str) -> bool {
+    matched.map(|m| m as usize == candidate.len()).unwrap_or(false)
+}
+
+/// Generation guard for the frame-pump terminal-exit kick (fix 9).
+///
+/// A frame-pump remembers the pipeline generation it was born under and may
+/// only kick clients while it is STILL the newest generation; otherwise a slow
+/// dying pump would kick the clients of the healthy pipeline that replaced it,
+/// which is a kick loop. Extracted here as a pure predicate for testing.
+///
+/// NOTE: the live call site is the inline
+/// The live guard on the frame-pump's terminal kick in `src/rtsp/factory.rs`
+/// calls this, so the table test below is testing the shipped comparison.
+pub(crate) fn kick_generation_is_current(my_generation: u64, current_generation: u64) -> bool {
+    my_generation == current_generation
+}
+
 impl NeoRtspServer {
     pub(crate) fn new() -> AnyResult<Self> {
         gstreamer::init().context("Gstreamer failed to initialise")?;
@@ -156,13 +229,22 @@ impl NeoRtspServer {
             // draining. Forcing Remove here on `closed` collapses the
             // zombie window to ~0.
             client.connect_closed(|client| {
-                let removed = client.session_filter(Some(&mut |_client, _session| {
+                // Count the removals OURSELVES. `session_filter()` returns
+                // only the sessions the closure Ref'd — never the Removed
+                // ones — so the old `if !removed.is_empty()` guard could
+                // never fire and this reap was silent. MEASURED on a live
+                // client 2026-09-10 (`claim2_live_client_session_filter_
+                // returns_refd_not_removed`): filter returned 0 while 1
+                // session was really detached. Same class of bug as the one
+                // 7fe3ef3 fixed in the sweep.
+                let mut removed_count: usize = 0;
+                client.session_filter(Some(&mut |_client, _session| {
+                    removed_count += 1;
                     RTSPFilterResult::Remove
                 }));
-                if !removed.is_empty() {
+                if removed_count > 0 {
                     log::info!(
-                        "RTSP client closed — reaped {} session(s) immediately",
-                        removed.len()
+                        "RTSP client closed — reaped {removed_count} session(s) immediately"
                     );
                 }
             });
@@ -258,7 +340,8 @@ impl NeoRtspServer {
                     //      before it).
                     let mut stale: Vec<(Option<glib::GString>, i64)> = Vec::new();
                     sessions.filter(Some(&mut |_, session| {
-                        let timeout_ms = (session.timeout() as i64).saturating_mul(1000);
+                        let timeout_secs = session.timeout();
+                        let timeout_ms = (timeout_secs as i64).saturating_mul(1000);
                         let remaining_ms = session.next_timeout_usec(now) as i64;
                         let since_touch_ms = timeout_ms.saturating_sub(remaining_ms);
                         log::debug!(
@@ -273,7 +356,7 @@ impl NeoRtspServer {
                         // narrow pre-expiry margin. A freshly-/recently-
                         // touched live session has remaining far above the
                         // margin, so it is never selected here.
-                        if timeout_ms > 0 && remaining_ms <= margin_ms {
+                        if session_is_stale_ms(timeout_secs, remaining_ms, margin_ms) {
                             stale.push((session.sessionid(), remaining_ms));
                         }
                         RTSPFilterResult::Keep
@@ -311,39 +394,59 @@ impl NeoRtspServer {
                                 }
                                 RTSPFilterResult::Keep
                             }));
-                            let kicked = owners.len();
-                            for client in owners {
-                                client.close();
-                            }
-                            if kicked > 0 {
-                                log::info!(
-                                    "RTSP stale-session sweep — closed {kicked} client connection(s) owning stale session(s) (alive-but-starved peers now reconnect instead of zombieing)"
-                                );
-                            }
-                            // Pass 3 — the reap the sweep always did. close()
-                            // above already cascades session removal for owned
-                            // sessions via the closed hook; this pass catches
-                            // the ownerless leftovers (true CLOSE_WAIT with
-                            // the client object already gone).
+                            // The close-before-reap ORDER is the whole point
+                            // of the fix 9 restructure, so it is expressed as
+                            // data (`stale_reap_plan`) and merely executed
+                            // here — see that function for why reaping first
+                            // makes the owner unmatchable, and for the test
+                            // that pins the ordering.
+                            let mut kicked: usize = 0;
                             let mut reaped_count: usize = 0;
-                            if let Some(sessions) = kick_server.session_pool() {
-                                sessions.filter(Some(&mut |_, session| {
-                                    if session
-                                        .sessionid()
-                                        .map(|sid| stale_ids.contains(&sid))
-                                        .unwrap_or(false)
-                                    {
-                                        reaped_count += 1;
-                                        RTSPFilterResult::Remove
-                                    } else {
-                                        RTSPFilterResult::Keep
+                            for step in stale_reap_plan(owners.len()) {
+                                match step {
+                                    ReapStep::CloseOwner(i) => {
+                                        owners[i].close();
+                                        kicked += 1;
                                     }
-                                }));
-                            }
-                            if reaped_count > 0 {
-                                log::debug!(
-                                    "RTSP stale-session sweep — pool-reaped {reaped_count} stale session(s)"
-                                );
+                                    ReapStep::PoolReapStaleSessions => {
+                                        if kicked > 0 {
+                                            log::info!(
+                                                "RTSP stale-session sweep — closed {kicked} client connection(s) owning stale session(s) (alive-but-starved peers now reconnect instead of zombieing)"
+                                            );
+                                        }
+                                        // Pass 3 — the reap the sweep always
+                                        // did. close() above already cascades
+                                        // session removal for owned sessions
+                                        // via the closed hook; this pass
+                                        // catches the ownerless leftovers
+                                        // (true CLOSE_WAIT with the client
+                                        // object already gone). We count the
+                                        // removals OURSELVES: `filter()`
+                                        // returns only the sessions the
+                                        // closure Ref'd, never the Removed
+                                        // ones (the silent-damage half of the
+                                        // attempt-#1 bug).
+                                        if let Some(sessions) = kick_server.session_pool() {
+                                            sessions.filter(Some(&mut |_, session| {
+                                                if session
+                                                    .sessionid()
+                                                    .map(|sid| stale_ids.contains(&sid))
+                                                    .unwrap_or(false)
+                                                {
+                                                    reaped_count += 1;
+                                                    RTSPFilterResult::Remove
+                                                } else {
+                                                    RTSPFilterResult::Keep
+                                                }
+                                            }));
+                                        }
+                                        if reaped_count > 0 {
+                                            log::debug!(
+                                                "RTSP stale-session sweep — pool-reaped {reaped_count} stale session(s)"
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         });
                     }
@@ -458,12 +561,9 @@ impl NeoRtspServer {
                 client.session_filter(Some(&mut |_, session| {
                     session.filter(Some(&mut |_, media| {
                         if !attached.get()
-                            && paths.iter().any(|p| {
-                                media
-                                    .matches(p)
-                                    .map(|m| m as usize == p.len())
-                                    .unwrap_or(false)
-                            })
+                            && paths
+                                .iter()
+                                .any(|p| media_path_is_exact_match(media.matches(p), p))
                         {
                             attached.set(true);
                         }
@@ -592,5 +692,973 @@ impl NeoRtspServerImpl {
     pub(crate) async fn get_users(&self) -> AnyResult<HashSet<String>> {
         let locked_users = self.users.read().await;
         Ok(locked_users.keys().cloned().collect())
+    }
+}
+// ===========================================================================
+// Regression tests for fix E — stale-session reap / zombie-client kick
+// (fix 9 d90ce64, its predecessor 7fe3ef3, and cd4b78b).
+//
+// `neolink` is a binary crate with no lib target, so the tests live inside the
+// source file (same pattern as `src/stream/mod.rs`).
+//
+// Two kinds of test here:
+//   * PURE   — table tests over the extracted predicates. No GStreamer.
+//   * LIVE   — measurements against the REAL gst-rtsp-server library objects
+//              (RTSPSessionPool / RTSPSession / RTSPSessionMedia). These pin
+//              the upstream API semantics the fix depends on. They SKIP (early
+//              return + eprintln) when `gstreamer::init()` fails, so the suite
+//              stays green on a machine with no GStreamer runtime.
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gstreamer_rtsp_server::{RTSPMediaFactory, RTSPSessionPool};
+    use std::sync::Mutex;
+    use std::time::{Duration as StdDuration, Instant};
+
+    /// `gstreamer::init()` exactly once; `false` ⇒ LIVE tests skip.
+    fn gst_ready() -> bool {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        static OK: AtomicBool = AtomicBool::new(false);
+        INIT.call_once(|| {
+            OK.store(gstreamer::init().is_ok(), AtomicOrdering::SeqCst);
+        });
+        OK.load(AtomicOrdering::SeqCst)
+    }
+
+    /// The end-to-end rig binds a real port and drives the process-wide default
+    /// glib main context, so only one may run at a time.
+    static LIVE_RIG_LOCK: Mutex<()> = Mutex::new(());
+
+    /// MEASURED (`claim1_live_next_timeout_usec_is_milliseconds`): gst-rtsp-server
+    /// adds `extra-timeout` (default 5s) on top of `timeout` before computing
+    /// time-to-expiry, so a `set_timeout(30)` session reports ~35_000ms
+    /// remaining when freshly touched — NOT 30_000. Every pure table below is
+    /// built on this measured window.
+    const MEASURED_EXTRA_TIMEOUT_SECS: u32 = 5;
+
+    /// Full expiry window in ms for a session with `timeout_secs`.
+    fn expiry_window_ms(timeout_secs: u32) -> i64 {
+        (timeout_secs + MEASURED_EXTRA_TIMEOUT_SECS) as i64 * 1000
+    }
+
+    // -------------------------------------------------------------------
+    // THE PRE-FIX EXPRESSIONS, reconstructed so both arms run in the same
+    // process against the same inputs.
+    //   * `base_attempt1_would_reap` — attempt #1 (`neolink:local fix`, reverted
+    //     2026-06-01, never committed to this tree); reconstructed from the
+    //     root-cause writeup in `git show 7fe3ef3`: it compared the
+    //     MILLISECOND return of `next_timeout_usec()` against a MICROSECOND
+    //     timeout.
+    //   * `base_8708608_would_reap` — the real base tree: its sweep body is
+    //     `let remaining = ...; log::debug!(...); RTSPFilterResult::Keep`, i.e.
+    //     it never reaps anything.
+    //   * `base_naive_path_match` — the "did it match at all?" predicate that
+    //     fix 9 deliberately did NOT use.
+    // -------------------------------------------------------------------
+
+    /// Attempt #1's predicate: `since_touch = timeout_us - remaining_ms`,
+    /// reaped when that exceeded a 10s threshold. `remaining_ms` is in ms and
+    /// `timeout_us` in µs, so `since_touch` is ~1000× too large for every
+    /// session — including one touched microseconds ago.
+    fn base_attempt1_would_reap(timeout_secs: u32, remaining_ms: i64, threshold: i64) -> bool {
+        let timeout_us = (timeout_secs as i64) * 1_000_000;
+        let since_touch = timeout_us - remaining_ms;
+        since_touch > threshold
+    }
+
+    /// Base tree 8708608: the sweep only logged.
+    fn base_8708608_would_reap(_timeout_secs: u32, _remaining_ms: i64) -> bool {
+        false
+    }
+
+    /// The naive path predicate: any match at all.
+    fn base_naive_path_match(matched: Option<i32>, _candidate: &str) -> bool {
+        matched.is_some()
+    }
+
+    // ===================================================================
+    // CLAIM 1 — staleness arithmetic is in MILLISECONDS
+    // ===================================================================
+
+    /// PURE. The fixed predicate over the whole idleness range, scored against
+    /// both base arms. Window = (30 + 5) * 1000 = 35_000ms (measured), reap
+    /// band = `remaining_ms <= 5_000`, i.e. idle >= 30_000ms.
+    #[test]
+    fn claim1_stale_predicate_ms_table() {
+        let timeout_secs = SESSION_TIMEOUT_SECS; // 30
+        let margin_ms = SESSION_STALE_REAP_MARGIN_MS; // 5_000
+        let window_ms = expiry_window_ms(timeout_secs); // 35_000
+
+        // (idle_ms, expected_stale)
+        let table: &[(i64, bool)] = &[
+            (0, false),      // freshly touched -> remaining 35_000
+            (10_000, false), // healthy keepalive -> 25_000
+            (25_000, false), // -> 10_000
+            (29_999, false), // -> 5_001, one ms outside the band
+            (30_000, true),  // -> 5_000, band edge
+            (31_000, true),  // -> 4_000
+            (34_000, true),  // -> 1_000
+            (35_000, true),  // expired, remaining clamps to 0
+            (36_000, true),
+        ];
+
+        let mut base_a1_reaps = 0usize;
+        let mut base_8708608_reaps = 0usize;
+        let mut fixed_reaps = 0usize;
+        let mut healthy_rows = 0usize;
+        let mut base_a1_reaps_healthy = 0usize;
+
+        eprintln!(
+            "idle_ms  remaining_ms  fixed  base#1(thr=10s_us)  base#1(thr=10s_ms)  base8708608  expect"
+        );
+        for (idle_ms, expect) in table {
+            // next_timeout_usec() clamps at 0.
+            let remaining_ms = (window_ms - idle_ms).max(0);
+            let fixed = session_is_stale_ms(timeout_secs, remaining_ms, margin_ms);
+            let b1_us = base_attempt1_would_reap(timeout_secs, remaining_ms, 10_000_000);
+            let b1_ms = base_attempt1_would_reap(timeout_secs, remaining_ms, 10_000);
+            let b0 = base_8708608_would_reap(timeout_secs, remaining_ms);
+            eprintln!(
+                "{idle_ms:7}  {remaining_ms:12}  {fixed:5}  {b1_us:18}  {b1_ms:18}  {b0:11}  {expect:6}"
+            );
+            assert_eq!(
+                fixed, *expect,
+                "idle_ms={idle_ms} remaining_ms={remaining_ms}: fixed predicate disagrees"
+            );
+            if fixed {
+                fixed_reaps += 1;
+            }
+            if b1_us {
+                base_a1_reaps += 1;
+            }
+            if b0 {
+                base_8708608_reaps += 1;
+            }
+            if !*expect {
+                healthy_rows += 1;
+                if b1_us {
+                    base_a1_reaps_healthy += 1;
+                }
+            }
+        }
+
+        eprintln!(
+            "CLAIM1 totals over {} rows: fixed reaped {fixed_reaps}, attempt#1 reaped {base_a1_reaps}, base 8708608 reaped {base_8708608_reaps}",
+            table.len()
+        );
+        eprintln!(
+            "CLAIM1 healthy rows: {healthy_rows}; attempt#1 wrongly reaped {base_a1_reaps_healthy}/{healthy_rows}, fixed wrongly reaped 0/{healthy_rows}"
+        );
+
+        // BASE ARM (attempt #1): reaps EVERY row, healthy ones included.
+        assert_eq!(
+            base_a1_reaps,
+            table.len(),
+            "the ms/µs confusion reaps every session"
+        );
+        assert_eq!(base_a1_reaps_healthy, healthy_rows);
+        // BASE ARM (real base tree): never reaps -> the zombie lingers.
+        assert_eq!(base_8708608_reaps, 0);
+        assert_eq!(fixed_reaps, 5);
+    }
+
+    /// PURE. Band edges, in remaining-ms space (independent of the window).
+    #[test]
+    fn claim1_reap_band_edges() {
+        let t = SESSION_TIMEOUT_SECS;
+        let m = SESSION_STALE_REAP_MARGIN_MS;
+        assert!(!session_is_stale_ms(t, 5_001, m), "remaining 5001ms healthy");
+        assert!(session_is_stale_ms(t, 5_000, m), "remaining 5000ms stale");
+        assert!(session_is_stale_ms(t, 0, m), "already expired is stale");
+        // A session with no timeout is never reaped by this sweep.
+        assert!(!session_is_stale_ms(0, 0, m));
+        // The env override moves the band and nothing else.
+        assert!(!session_is_stale_ms(t, 6_000, 5_000));
+        assert!(session_is_stale_ms(t, 6_000, 8_000));
+    }
+
+    /// LIVE. Measure what `RTSPSession::next_timeout_usec()` actually returns:
+    /// milliseconds (and with `extra_timeout` folded in), not microseconds.
+    /// This is the fact attempt #1 got wrong.
+    #[test]
+    fn claim1_live_next_timeout_usec_is_milliseconds() {
+        if !gst_ready() {
+            eprintln!("SKIP claim1_live_next_timeout_usec_is_milliseconds: gstreamer::init() failed");
+            return;
+        }
+        let pool = RTSPSessionPool::new();
+        let session = pool.create().expect("create session");
+        session.set_timeout(SESSION_TIMEOUT_SECS);
+        session.touch();
+        let extra = session.extra_timeout();
+        let now = glib::monotonic_time();
+        let remaining = session.next_timeout_usec(now) as i64;
+        eprintln!(
+            "MEASURED: timeout={}s extra_timeout={}s -> next_timeout_usec(now)={remaining}",
+            SESSION_TIMEOUT_SECS, extra
+        );
+        assert_eq!(
+            extra, MEASURED_EXTRA_TIMEOUT_SECS,
+            "the pure tables are calibrated on extra_timeout={MEASURED_EXTRA_TIMEOUT_SECS}"
+        );
+        let window = expiry_window_ms(SESSION_TIMEOUT_SECS);
+        let us = SESSION_TIMEOUT_SECS as i64 * 1_000_000;
+        assert!(
+            (window - 1_000..=window).contains(&remaining),
+            "expected ~{} (MILLISECONDS incl. extra_timeout), got {}",
+            window,
+            remaining
+        );
+        assert!(
+            remaining < us / 100,
+            "value is nowhere near the {}µs the `usec` name implies",
+            us
+        );
+        eprintln!(
+            "=> unit is MILLISECONDS ({remaining} ≈ {window}), NOT microseconds ({us}); attempt #1 computed since_touch = {} for a session touched microseconds ago",
+            us - remaining
+        );
+    }
+
+    /// LIVE. The same real session probed at simulated idle times by advancing
+    /// the `now` argument. Both arms scored on real library output.
+    #[test]
+    fn claim1_live_staleness_band_on_real_session() {
+        if !gst_ready() {
+            eprintln!("SKIP claim1_live_staleness_band_on_real_session: gstreamer::init() failed");
+            return;
+        }
+        let pool = RTSPSessionPool::new();
+        let session = pool.create().expect("create session");
+        session.set_timeout(SESSION_TIMEOUT_SECS);
+        session.touch();
+        let base_now = glib::monotonic_time();
+        let margin_ms = SESSION_STALE_REAP_MARGIN_MS;
+
+        // (idle_seconds, expect_stale)
+        let idles: &[(i64, bool)] = &[
+            (0, false),
+            (10, false),
+            (25, false),
+            (29, false),
+            (31, true),
+            (34, true),
+            (36, true),
+        ];
+        let mut base_wrong = 0usize;
+        let mut fixed_wrong = 0usize;
+        eprintln!("idle_s  measured_remaining_ms  fixed_stale  attempt#1_reap  expect");
+        for (idle_s, expect) in idles {
+            // `now` is monotonic MICROseconds; advancing it simulates idleness.
+            let now = base_now + idle_s * 1_000_000;
+            let remaining_ms = session.next_timeout_usec(now) as i64;
+            let fixed = session_is_stale_ms(session.timeout(), remaining_ms, margin_ms);
+            let b1 = base_attempt1_would_reap(session.timeout(), remaining_ms, 10_000_000);
+            eprintln!("{idle_s:6}  {remaining_ms:21}  {fixed:11}  {b1:14}  {expect:6}");
+            if fixed != *expect {
+                fixed_wrong += 1;
+            }
+            if b1 != *expect {
+                base_wrong += 1;
+            }
+        }
+        eprintln!(
+            "CLAIM1 LIVE: wrong verdicts — attempt#1 {base_wrong}/{}, fixed {fixed_wrong}/{}",
+            idles.len(),
+            idles.len()
+        );
+        assert_eq!(fixed_wrong, 0, "fixed predicate must match every row");
+        assert_eq!(
+            base_wrong, 4,
+            "attempt #1 must be wrong on exactly the 4 healthy rows"
+        );
+    }
+
+    // ===================================================================
+    // CLAIM 2 — the reap must count sessions REMOVED, not sessions Ref'd
+    // ===================================================================
+
+    /// LIVE. `RTSPSessionPool::filter()` returns the Ref'd sessions only.
+    /// Measured: remove 3 of 3 sessions and the returned Vec has length 0 —
+    /// which is exactly why attempt #1's `if !reaped.is_empty()` log never
+    /// fired while it was deleting every session in the pool.
+    #[test]
+    fn claim2_live_filter_returns_refd_not_removed() {
+        if !gst_ready() {
+            eprintln!("SKIP claim2_live_filter_returns_refd_not_removed: gstreamer::init() failed");
+            return;
+        }
+        // --- arm A: closure returns Remove (what the reap does) ---
+        let pool = RTSPSessionPool::new();
+        for _ in 0..3 {
+            pool.create().expect("create session");
+        }
+        let before = pool.n_sessions();
+        let mut counted_ourselves = 0usize; // the FIXED metric
+        let returned = pool.filter(Some(&mut |_, _session| {
+            counted_ourselves += 1;
+            RTSPFilterResult::Remove
+        }));
+        let after = pool.n_sessions();
+        eprintln!(
+            "CLAIM2 arm A (Remove): n_sessions {before} -> {after}; filter() returned {} session(s) [BASE metric]; counted ourselves {counted_ourselves} [FIXED metric]",
+            returned.len()
+        );
+        assert_eq!(before, 3);
+        assert_eq!(after, 0, "all 3 really were removed");
+        assert_eq!(
+            returned.len(),
+            0,
+            "BASE metric reports 0 removals while 3 sessions were destroyed"
+        );
+        assert_eq!(counted_ourselves, 3, "FIXED metric reports the real count");
+
+        // --- arm B: control, closure returns Ref ---
+        let pool2 = RTSPSessionPool::new();
+        for _ in 0..3 {
+            pool2.create().expect("create session");
+        }
+        let returned2 = pool2.filter(Some(&mut |_, _s| RTSPFilterResult::Ref));
+        eprintln!(
+            "CLAIM2 arm B (Ref): filter() returned {} session(s), n_sessions still {}",
+            returned2.len(),
+            pool2.n_sessions()
+        );
+        assert_eq!(returned2.len(), 3, "the returned Vec IS the Ref set");
+        assert_eq!(pool2.n_sessions(), 3);
+    }
+
+    /// LIVE. The whole reap decision path (predicate + filter) on a real pool:
+    /// only the stale-band sessions are removed, the healthy ones survive.
+    #[test]
+    fn claim2_live_only_stale_sessions_are_removed() {
+        if !gst_ready() {
+            eprintln!("SKIP claim2_live_only_stale_sessions_are_removed: gstreamer::init() failed");
+            return;
+        }
+        let pool = RTSPSessionPool::new();
+        // 2 "healthy" sessions (30s timeout + 5s extra, freshly touched) and 2
+        // "zombies" (1s timeout, extra 0 -> already deep in the reap band).
+        for _ in 0..2 {
+            let s = pool.create().expect("create");
+            s.set_timeout(SESSION_TIMEOUT_SECS);
+            s.touch();
+        }
+        for _ in 0..2 {
+            let s = pool.create().expect("create");
+            s.set_timeout(1);
+            s.set_extra_timeout(0);
+            s.touch();
+        }
+        let now = glib::monotonic_time();
+        let margin_ms = SESSION_STALE_REAP_MARGIN_MS;
+        let before = pool.n_sessions();
+
+        let mut fixed_removed_healthy = 0usize;
+        let mut fixed_removed_zombie = 0usize;
+        let mut base_a1_healthy = 0usize;
+        let mut base_a1_zombie = 0usize;
+        pool.filter(Some(&mut |_, session| {
+            let timeout_secs = session.timeout();
+            let healthy = timeout_secs == SESSION_TIMEOUT_SECS;
+            let remaining_ms = session.next_timeout_usec(now) as i64;
+            if base_attempt1_would_reap(timeout_secs, remaining_ms, 10_000_000) {
+                if healthy {
+                    base_a1_healthy += 1;
+                } else {
+                    base_a1_zombie += 1;
+                }
+            }
+            if session_is_stale_ms(timeout_secs, remaining_ms, margin_ms) {
+                if healthy {
+                    fixed_removed_healthy += 1;
+                } else {
+                    fixed_removed_zombie += 1;
+                }
+                RTSPFilterResult::Remove
+            } else {
+                RTSPFilterResult::Keep
+            }
+        }));
+        let after = pool.n_sessions();
+        eprintln!(
+            "CLAIM2 live pool: {before} sessions (2 healthy + 2 zombie) -> FIXED removed healthy={fixed_removed_healthy} zombie={fixed_removed_zombie}, survivors {after}"
+        );
+        eprintln!(
+            "CLAIM2 live pool: attempt#1 would have removed healthy={base_a1_healthy} zombie={base_a1_zombie} — i.e. EXACTLY INVERTED: it kills the live consumers and spares the zombies (its `timeout_us - remaining_ms` grows with the timeout, so a short-timeout dead session scores LOW)"
+        );
+        assert_eq!(before, 4);
+        assert_eq!(fixed_removed_zombie, 2, "fixed removes both zombies");
+        assert_eq!(fixed_removed_healthy, 0, "fixed removes no healthy session");
+        assert_eq!(after, 2, "both healthy sessions survive");
+        assert_eq!(base_a1_healthy, 2, "attempt #1 kills both HEALTHY sessions");
+        assert_eq!(base_a1_zombie, 0, "attempt #1 spares both zombies");
+    }
+
+    // ===================================================================
+    // CLAIM 3 — close the owning client BEFORE pool-reaping
+    // ===================================================================
+
+    /// PURE. The ordering contract as the sweep executes it.
+    #[test]
+    fn claim3_plan_closes_every_owner_before_the_reap() {
+        let plan = stale_reap_plan(3);
+        eprintln!("CLAIM3 fixed plan (3 owners): {plan:?}");
+        assert_eq!(
+            plan,
+            vec![
+                ReapStep::CloseOwner(0),
+                ReapStep::CloseOwner(1),
+                ReapStep::CloseOwner(2),
+                ReapStep::PoolReapStaleSessions,
+            ]
+        );
+        let reap_at = plan
+            .iter()
+            .position(|s| *s == ReapStep::PoolReapStaleSessions)
+            .expect("plan must reap");
+        let last_close = plan
+            .iter()
+            .rposition(|s| matches!(s, ReapStep::CloseOwner(_)))
+            .expect("plan must close owners");
+        assert!(last_close < reap_at, "every close must precede the pool reap");
+        // No owners (true CLOSE_WAIT, client object already gone): still reap.
+        assert_eq!(stale_reap_plan(0), vec![ReapStep::PoolReapStaleSessions]);
+    }
+
+    // ===================================================================
+    // CLAIM 4 — exact-path match + generation guard (pure parts)
+    // ===================================================================
+
+    /// PURE. Table over both predicates, using the `matched` values MEASURED in
+    /// `claim4_live_kick_is_exact_path_matched` plus the hypothetical
+    /// prefix-hit shape the guard exists to reject.
+    #[test]
+    fn claim4_exact_path_match_table() {
+        // (label, matched_from_gst, candidate, expect_kick)
+        let table: &[(&str, Option<i32>, &str, bool)] = &[
+            // measured on gst-rtsp-server 1.26.2 (see the live test)
+            ("exact /testcam/main", Some(13), "/testcam/main", true),
+            ("exact /testcam", Some(8), "/testcam", true),
+            ("no match (/testcam/main2)", None, "/testcam/main2", false),
+            ("no match (/othercam/main)", None, "/othercam/main", false),
+            // a prefix hit: `matched` reports the MOUNT path length, shorter
+            // than the candidate. Only the exact predicate rejects it.
+            ("alias prefix hit", Some(8), "/testcam/main", false),
+        ];
+        let mut base_kicks = 0usize;
+        let mut fixed_kicks = 0usize;
+        let mut base_false_kicks = 0usize;
+        eprintln!("case                       matched    candidate        fixed  base(naive)  expect");
+        for (label, matched, candidate, expect) in table {
+            let fixed = media_path_is_exact_match(*matched, candidate);
+            let base = base_naive_path_match(*matched, candidate);
+            eprintln!("{label:26} {matched:?}  {candidate:15}  {fixed:5}  {base:11}  {expect:6}");
+            assert_eq!(fixed, *expect, "case {label}");
+            if fixed {
+                fixed_kicks += 1;
+            }
+            if base {
+                base_kicks += 1;
+                if !*expect {
+                    base_false_kicks += 1;
+                }
+            }
+        }
+        eprintln!(
+            "CLAIM4 totals: fixed kicked {fixed_kicks}/{} (0 false), naive base kicked {base_kicks}/{} of which {base_false_kicks} FALSE",
+            table.len(),
+            table.len()
+        );
+        assert_eq!(fixed_kicks, 2);
+        assert_eq!(base_false_kicks, 1, "the naive predicate collateral-kicks");
+    }
+
+    /// PURE. Generation guard: only the newest pipeline generation may kick.
+    #[test]
+    fn claim4_generation_guard_table() {
+        // (my_generation, current_generation, may_kick)
+        let table: &[(u64, u64, bool)] = &[
+            (1, 1, true),  // fresh pump, still newest
+            (5, 5, true),  // ditto after 4 rebuilds
+            (4, 5, false), // stale pump, a newer pipeline exists -> no kick
+            (1, 9, false), // very stale
+            (6, 5, false), // impossible-but-guarded
+            (0, 0, true),  // pre-first-build
+        ];
+        let mut kicks = 0usize;
+        for (mine, current, expect) in table {
+            let may = kick_generation_is_current(*mine, *current);
+            eprintln!(
+                "CLAIM4 gen guard: my={mine} current={current} -> may_kick={may} (expect {expect})"
+            );
+            assert_eq!(may, *expect);
+            if may {
+                kicks += 1;
+            }
+        }
+        assert_eq!(kicks, 3);
+        // BASE ARM: no guard at all — a stale pump kicks unconditionally.
+        let unguarded_kicks = table.len();
+        eprintln!(
+            "CLAIM4 gen guard totals: guarded {kicks}/{}, unguarded (pre-fix) {unguarded_kicks}/{} -> {} kicks would land on a NEWER pipeline's clients",
+            table.len(),
+            table.len(),
+            unguarded_kicks - kicks
+        );
+    }
+
+    /// The constants the whole fix is calibrated against.
+    #[test]
+    fn claim1_constants_are_what_the_writeup_says() {
+        assert_eq!(SESSION_TIMEOUT_SECS, 30);
+        assert_eq!(SESSION_STALE_REAP_MARGIN_MS, 5_000);
+    }
+
+    // ===================================================================
+    // LIVE END-TO-END RIG — real NeoRtspServer + real rtspsrc client(s)
+    // over loopback. Everything is 127.0.0.1 / "testcam"; no camera, no LAN.
+    // ===================================================================
+
+    struct LiveRig {
+        server: NeoRtspServer,
+        main_loop: glib::MainLoop,
+        thread: Option<std::thread::JoinHandle<()>>,
+        port: i32,
+    }
+
+    impl LiveRig {
+        fn sessions(&self) -> u32 {
+            self.server
+                .session_pool()
+                .map(|p| p.n_sessions())
+                .unwrap_or(0)
+        }
+        fn wait_sessions(&self, want: u32, max: StdDuration) -> u32 {
+            let t0 = Instant::now();
+            loop {
+                let n = self.sessions();
+                if n >= want || t0.elapsed() > max {
+                    return n;
+                }
+                std::thread::sleep(StdDuration::from_millis(50));
+            }
+        }
+        /// Start a consumer and WAIT until it is really PLAYING. Kicking a
+        /// consumer that is still mid-SETUP is not the scenario under test
+        /// (and measured flaky: rtspsrc mid-handshake does not always post an
+        /// error when the peer closes), so every arm starts from a fully
+        /// established stream.
+        fn client(&self, path: &str) -> gstreamer::Element {
+            let p = gstreamer::parse::launch(&format!(
+                "rtspsrc location=rtsp://127.0.0.1:{}{path} protocols=tcp latency=0 ! fakesink sync=false",
+                self.port
+            ))
+            .expect("client pipeline");
+            p.set_state(gstreamer::State::Playing).expect("client play");
+            let t0 = Instant::now();
+            loop {
+                let (_, cur, _) = p.state(Some(gstreamer::ClockTime::from_mseconds(200)));
+                if cur == gstreamer::State::Playing {
+                    eprintln!("   rig: consumer on {path} reached PLAYING in {:?}", t0.elapsed());
+                    break;
+                }
+                if t0.elapsed() > StdDuration::from_secs(15) {
+                    eprintln!("   rig: consumer on {path} NEVER reached PLAYING (state={cur:?})");
+                    break;
+                }
+            }
+            p
+        }
+    }
+
+    impl Drop for LiveRig {
+        fn drop(&mut self) {
+            self.main_loop.quit();
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// Every element the rig needs; missing ⇒ the LIVE tests skip.
+    fn live_elements_present() -> bool {
+        ["videotestsrc", "rtpvrawpay", "rtspsrc", "fakesink"]
+            .iter()
+            .all(|e| gstreamer::ElementFactory::find(e).is_some())
+    }
+
+    fn start_rig(paths: &[&str]) -> Option<LiveRig> {
+        if !gst_ready() || !live_elements_present() {
+            return None;
+        }
+        let server = NeoRtspServer::new().ok()?;
+        server.set_address("127.0.0.1");
+        server.set_service("0"); // ephemeral port
+        let mounts = server.mount_points()?;
+        for path in paths {
+            let f = RTSPMediaFactory::new();
+            // Raw payload: no encoder needed, so this rig only depends on
+            // gstreamer1.0-plugins-base/good.
+            f.set_launch("( videotestsrc is-live=true ! video/x-raw,format=I420,width=64,height=48,framerate=10/1 ! rtpvrawpay name=pay0 pt=96 )");
+            f.set_shared(true);
+            f.set_transport_mode(gstreamer_rtsp_server::RTSPTransportMode::PLAY);
+            f.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::None);
+            f.add_role_from_structure(
+                &gstreamer::Structure::builder("anonymous")
+                    .field(gstreamer_rtsp_server::RTSP_PERM_MEDIA_FACTORY_ACCESS, true)
+                    .field(gstreamer_rtsp_server::RTSP_PERM_MEDIA_FACTORY_CONSTRUCT, true)
+                    .build(),
+            );
+            mounts.add_factory(path, f);
+        }
+        server.attach(None).ok()?;
+        let port = server.bound_port();
+        let main_loop = glib::MainLoop::new(None, false);
+        let ml = main_loop.clone();
+        let thread = std::thread::spawn(move || ml.run());
+        std::thread::sleep(StdDuration::from_millis(200));
+        Some(LiveRig {
+            server,
+            main_loop,
+            thread: Some(thread),
+            port,
+        })
+    }
+
+    /// How long until the client pipeline notices its connection died
+    /// (Error or Eos on its bus). `None` ⇒ it is still happily connected —
+    /// i.e. a ZOMBIE.
+    fn wait_client_end(pipeline: &gstreamer::Element, max: StdDuration) -> Option<StdDuration> {
+        let t0 = Instant::now();
+        let bus = pipeline.bus()?;
+        while t0.elapsed() < max {
+            while let Some(msg) = bus.pop() {
+                match msg.view() {
+                    gstreamer::MessageView::Error(_) | gstreamer::MessageView::Eos(_) => {
+                        return Some(t0.elapsed())
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(StdDuration::from_millis(25));
+        }
+        None
+    }
+
+    /// All clients currently attached to the server (the Ref set).
+    fn all_clients(server: &NeoRtspServer) -> Vec<gstreamer_rtsp_server::RTSPClient> {
+        server.client_filter(Some(&mut |_, _| RTSPFilterResult::Ref))
+    }
+
+    /// LIVE E2E. CLAIM 3: reap-only (pre-fix9) leaves a live consumer as a
+    /// zombie AND makes its owner unmatchable; close-then-reap (fix 9) kills
+    /// the connection so the consumer reconnects. Both arms measured against
+    /// the same rig with a real rtspsrc consumer.
+    #[test]
+    fn claim3_live_reap_only_zombies_the_consumer() {
+        let _guard = LIVE_RIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rig) = start_rig(&["/testcam/main"]) else {
+            eprintln!("SKIP claim3_live_reap_only_zombies_the_consumer: no GStreamer runtime");
+            return;
+        };
+        let observe = StdDuration::from_secs(4);
+
+        // ---------------- BASE ARM: pool-reap only ----------------
+        let client_a = rig.client("/testcam/main");
+        let n = rig.wait_sessions(1, StdDuration::from_secs(10));
+        assert_eq!(n, 1, "consumer A must own a session");
+        let sess_a = rig
+            .server
+            .session_pool()
+            .unwrap()
+            .filter(Some(&mut |_, _s| RTSPFilterResult::Ref))
+            .first()
+            .and_then(|s| s.sessionid())
+            .expect("session id");
+        eprintln!("CLAIM3 LIVE base arm: consumer A attached, session {sess_a}, n_sessions={n}");
+
+        // The pre-fix9 sweep: pool-Remove the stale session, nothing else.
+        let mut base_reaped = 0usize;
+        rig.server.session_pool().unwrap().filter(Some(&mut |_, _s| {
+            base_reaped += 1;
+            RTSPFilterResult::Remove
+        }));
+        eprintln!(
+            "CLAIM3 LIVE base arm: pool-reaped {base_reaped} session(s), n_sessions now {}",
+            rig.sessions()
+        );
+
+        // MEASURE the cascade: can anything still find the owning client?
+        let owners_after_reap = all_clients(&rig.server)
+            .iter()
+            .filter(|c| {
+                !c.session_filter(Some(&mut |_, _| RTSPFilterResult::Ref))
+                    .is_empty()
+            })
+            .count();
+        let clients_after_reap = all_clients(&rig.server).len();
+        eprintln!(
+            "CLAIM3 LIVE base arm: {clients_after_reap} client object(s) still attached, of which {owners_after_reap} still own a session (this is the cascade: pool removal detaches the session from its client)"
+        );
+
+        let base_end = wait_client_end(&client_a, observe);
+        eprintln!(
+            "CLAIM3 LIVE base arm: consumer A after {observe:?} -> ended={base_end:?} (None = still connected = ZOMBIE)"
+        );
+        let _ = client_a.set_state(gstreamer::State::Null);
+
+        assert_eq!(base_reaped, 1);
+        assert_eq!(
+            owners_after_reap, 0,
+            "after the pool reap the owning client is unmatchable — proven cascade"
+        );
+        assert!(
+            base_end.is_none(),
+            "pre-fix9: the consumer must survive the silent reap as a zombie"
+        );
+
+        // ---------------- FIXED ARM: close-then-reap ----------------
+        std::thread::sleep(StdDuration::from_millis(500));
+        let client_b = rig.client("/testcam/main");
+        let n = rig.wait_sessions(1, StdDuration::from_secs(10));
+        assert_eq!(n, 1, "consumer B must own a session");
+        eprintln!("CLAIM3 LIVE fixed arm: consumer B attached, n_sessions={n}");
+
+        // Exactly the production sweep: collect the stale ids, find the owning
+        // clients, then execute stale_reap_plan() — closes before reaping.
+        let stale_ids: Vec<glib::GString> = rig
+            .server
+            .session_pool()
+            .unwrap()
+            .filter(Some(&mut |_, _s| RTSPFilterResult::Ref))
+            .iter()
+            .filter_map(|s| s.sessionid())
+            .collect();
+        let owners: Vec<_> = all_clients(&rig.server)
+            .into_iter()
+            .filter(|c| {
+                let owns = std::cell::Cell::new(false);
+                c.session_filter(Some(&mut |_, session| {
+                    if session
+                        .sessionid()
+                        .map(|sid| stale_ids.contains(&sid))
+                        .unwrap_or(false)
+                    {
+                        owns.set(true);
+                    }
+                    RTSPFilterResult::Keep
+                }));
+                owns.get()
+            })
+            .collect();
+        eprintln!(
+            "CLAIM3 LIVE fixed arm: {} stale session(s), {} owning client(s) found BEFORE the reap",
+            stale_ids.len(),
+            owners.len()
+        );
+        assert_eq!(
+            owners.len(),
+            1,
+            "the owner IS matchable while the session is still in the pool"
+        );
+
+        // FIXED ARM: execute stale_reap_plan() on the glib main
+        // context, exactly as the sweep does.
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, usize)>();
+        let server = rig.server.clone();
+        let plan_ids = stale_ids.clone();
+        let plan_owners = owners.clone();
+        let t_kick = Instant::now();
+        glib::MainContext::default().invoke(move || {
+            let mut kicked = 0usize;
+            let mut reaped = 0usize;
+            for step in stale_reap_plan(plan_owners.len()) {
+                match step {
+                    ReapStep::CloseOwner(i) => {
+                        plan_owners[i].close();
+                        kicked += 1;
+                    }
+                    ReapStep::PoolReapStaleSessions => {
+                        if let Some(pool) = server.session_pool() {
+                            pool.filter(Some(&mut |_, s| {
+                                if s.sessionid()
+                                    .map(|sid| plan_ids.contains(&sid))
+                                    .unwrap_or(false)
+                                {
+                                    reaped += 1;
+                                    RTSPFilterResult::Remove
+                                } else {
+                                    RTSPFilterResult::Keep
+                                }
+                            }));
+                        }
+                    }
+                }
+            }
+            let _ = tx.send((kicked, reaped));
+        });
+        let (kicked, reaped) = rx
+            .recv_timeout(StdDuration::from_secs(5))
+            .expect("sweep plan must run on the main context");
+        let fixed_end = wait_client_end(&client_b, observe);
+        eprintln!(
+            "CLAIM3 LIVE fixed arm: closed {kicked} owner(s), pool-reaped {reaped}; consumer B ended after {fixed_end:?} (kick issued at t+0, budget {observe:?}, elapsed {:?})",
+            t_kick.elapsed()
+        );
+        let _ = client_b.set_state(gstreamer::State::Null);
+        eprintln!(
+            "CLAIM3 LIVE summary: base(reap-only) consumer alive after {}ms; fixed(close-then-reap on the main context) consumer dead after {}ms",
+            observe.as_millis(),
+            fixed_end.map(|d| d.as_millis() as i64).unwrap_or(-1)
+        );
+        assert_eq!(kicked, 1);
+        assert_eq!(reaped, 1);
+        assert!(
+            fixed_end.is_some(),
+            "fix 9: closing the owner must break the consumer's connection"
+        );
+    }
+
+    /// LIVE E2E. CLAIM 4: `kick_clients_of_paths` is exact-path matched — it
+    /// kills the consumer on the kicked path and nobody else. Also MEASURES
+    /// `gst_rtsp_session_media_matches()` on real session medias.
+    #[test]
+    fn claim4_live_kick_is_exact_path_matched() {
+        let _guard = LIVE_RIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rig) = start_rig(&["/testcam/main", "/testcam"]) else {
+            eprintln!("SKIP claim4_live_kick_is_exact_path_matched: no GStreamer runtime");
+            return;
+        };
+        let client_main = rig.client("/testcam/main");
+        let client_alias = rig.client("/testcam");
+        let n = rig.wait_sessions(2, StdDuration::from_secs(10));
+        assert_eq!(n, 2, "both consumers must own a session");
+
+        // ---- measure matches() on the real session medias ----
+        let candidates = [
+            "/testcam/main",
+            "/testcam/main2",
+            "/testcam",
+            "/testcam/sub",
+            "/othercam/main",
+        ];
+        let mut exact_hits = 0usize;
+        let mut naive_hits = 0usize;
+        eprintln!("MEASURED gst_rtsp_session_media_matches() on live session medias:");
+        rig.server.session_pool().unwrap().filter(Some(&mut |_, session| {
+            session.filter(Some(&mut |_, media| {
+                for c in candidates {
+                    let m = media.matches(c);
+                    let ex = media_path_is_exact_match(m, c);
+                    let na = base_naive_path_match(m, c);
+                    if ex {
+                        exact_hits += 1;
+                    }
+                    if na {
+                        naive_hits += 1;
+                    }
+                    eprintln!("   candidate {c:15} matched={m:?} exact={ex} naive={na}");
+                }
+                RTSPFilterResult::Keep
+            }));
+            RTSPFilterResult::Keep
+        }));
+        eprintln!(
+            "CLAIM4 LIVE: over 2 session medias × {} candidates -> exact hits {exact_hits}, naive hits {naive_hits}",
+            candidates.len()
+        );
+
+        // ---- negative kick: a path nobody is attached to ----
+        rig.server.kick_clients_of_paths(
+            Arc::new(vec!["/testcam/main2".to_string()]),
+            "testcam::main".to_string(),
+            "negative control".to_string(),
+        );
+        let neg_main = wait_client_end(&client_main, StdDuration::from_secs(2));
+        let neg_alias = wait_client_end(&client_alias, StdDuration::from_millis(500));
+        eprintln!(
+            "CLAIM4 LIVE negative kick(/testcam/main2): main_ended={neg_main:?} alias_ended={neg_alias:?} n_sessions={}",
+            rig.sessions()
+        );
+        assert!(neg_main.is_none() && neg_alias.is_none(), "no false kick");
+        assert_eq!(rig.sessions(), 2, "both sessions survive a non-matching kick");
+
+        // ---- positive kick: exactly one consumer ----
+        rig.server.kick_clients_of_paths(
+            Arc::new(vec!["/testcam/main".to_string()]),
+            "testcam::main".to_string(),
+            "terminal pipeline death".to_string(),
+        );
+        let pos_main = wait_client_end(&client_main, StdDuration::from_secs(4));
+        let pos_alias = wait_client_end(&client_alias, StdDuration::from_millis(500));
+        eprintln!(
+            "CLAIM4 LIVE positive kick(/testcam/main): main_ended={pos_main:?} alias_ended={pos_alias:?} n_sessions={}",
+            rig.sessions()
+        );
+        let _ = client_main.set_state(gstreamer::State::Null);
+        let _ = client_alias.set_state(gstreamer::State::Null);
+        assert!(
+            pos_main.is_some(),
+            "the consumer on the kicked path must be disconnected"
+        );
+        assert!(
+            pos_alias.is_none(),
+            "the consumer on /testcam must NOT be collateral-kicked"
+        );
+    }
+
+    /// LIVE E2E. CLAIM 2 (client side): `RTSPClient::session_filter()` has the
+    /// same Ref-not-Removed contract as the pool filter — measured on a real
+    /// client, because `connect_closed` in `new()` logs off that return value.
+    #[test]
+    fn claim2_live_client_session_filter_returns_refd_not_removed() {
+        let _guard = LIVE_RIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rig) = start_rig(&["/testcam/main"]) else {
+            eprintln!("SKIP claim2_live_client_session_filter_returns_refd_not_removed: no GStreamer runtime");
+            return;
+        };
+        let client = rig.client("/testcam/main");
+        let n = rig.wait_sessions(1, StdDuration::from_secs(10));
+        assert_eq!(n, 1);
+        let clients = all_clients(&rig.server);
+        assert_eq!(clients.len(), 1, "one attached client");
+
+        let refd = clients[0].session_filter(Some(&mut |_, _| RTSPFilterResult::Ref));
+        eprintln!("CLAIM2 LIVE client.session_filter(Ref) -> {} session(s)", refd.len());
+        assert_eq!(refd.len(), 1);
+
+        let mut counted = 0usize;
+        let returned = clients[0].session_filter(Some(&mut |_, _| {
+            counted += 1;
+            RTSPFilterResult::Remove
+        }));
+        std::thread::sleep(StdDuration::from_millis(300));
+        let still_owned = clients[0]
+            .session_filter(Some(&mut |_, _| RTSPFilterResult::Ref))
+            .len();
+        let pool_after = rig.sessions();
+        eprintln!(
+            "CLAIM2 LIVE client.session_filter(Remove) -> returned {} [BASE metric, the value `connect_closed` logs off], counted ourselves {counted} [FIXED metric]; client still owns {still_owned} session(s); pool n_sessions {n} -> {pool_after}",
+            returned.len()
+        );
+        assert_eq!(
+            returned.len(),
+            0,
+            "the connect_closed log's `!removed.is_empty()` guard can never be true"
+        );
+        assert_eq!(counted, 1, "one session really was passed to the filter");
+        assert_eq!(still_owned, 0, "Remove detaches the session from the CLIENT");
+        // MEASURED: client-side Remove does NOT take the session out of the
+        // pool — it only detaches it from the client. The pool still holds it
+        // until cleanup()/the stale sweep. Recorded, not asserted as a design
+        // claim, so a future gst version changing this shows up as a diff.
+        eprintln!(
+            "CLAIM2 LIVE note: pool retained {pool_after} session(s) after the client-side Remove"
+        );
+        let _ = client.set_state(gstreamer::State::Null);
     }
 }

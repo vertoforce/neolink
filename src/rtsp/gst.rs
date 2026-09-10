@@ -7,6 +7,6 @@ mod shared;
 
 pub(crate) use factory::*;
 
-pub(crate) use self::server::NeoRtspServer;
+pub(crate) use self::server::{kick_generation_is_current, NeoRtspServer};
 
 type AnyResult<T> = std::result::Result<T, anyhow::Error>;
