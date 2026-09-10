@@ -1,5 +1,9 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::atomic::Ordering,
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, GhostPad};
@@ -12,7 +16,7 @@ use neolink_core::{
 };
 use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
 
-use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
+use crate::{common::{now_epoch_ms, NeoInstance}, rtsp::gst::NeoMediaFactory, AnyResult};
 
 #[derive(Clone, Debug)]
 pub enum AudioType {
@@ -158,6 +162,11 @@ pub(super) async fn make_factory(
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
         let name = camera.config().await?.borrow().name.clone();
+        // Per-camera frame-arrival cell. The frame-pump thread updates this
+        // on every successful push_buffer; the camthread BC ping watchdog
+        // reads it to decide whether to honor a ping timeout. See
+        // common/camthread.rs for the design rationale.
+        let last_frame_at = camera.last_frame_at().await?;
 
         while let Some(msg) = client_rx.recv().await {
             match msg {
@@ -165,6 +174,7 @@ pub(super) async fn make_factory(
                     log::debug!("New client for {name}::{stream}");
                     let camera = camera.clone();
                     let name = name.clone();
+                    let last_frame_at = last_frame_at.clone();
                     tokio::task::spawn(async move {
                         clear_bin(&element)?;
                         log::trace!("{name}::{stream}: Starting camera");
@@ -242,41 +252,81 @@ pub(super) async fn make_factory(
 
                         // Run blocking code on a seperate thread
                         // This is not an async thread
+                        let frame_pump_last_frame_at = last_frame_at.clone();
                         std::thread::spawn(move || {
                             let mut aud_ts: u64 = 0;
                             let mut vid_ts: u64 = 0;
                             let mut pools = Default::default();
-                            // Thread resilience: drop the frame and keep going
-                            // on any send error. Empirically the wedge story:
-                            //   - Exiting on first error (original): dead thread,
-                            //     dead pipeline, hours-long wedges.
-                            //   - Exiting on N=500 consecutive (e3a0ec4): thread
-                            //     exits cleanly, but the outer factory never
-                            //     rebuilds because Frigate's go2rtc keeps its
-                            //     TCP connection open — no new-client event
-                            //     fires, pipeline stays orphaned. Observed
-                            //     2026-04-22 05:51: thread exited, stream dead
-                            //     for 72 min until segment-watchdog bounced us.
-                            //   - Never exit (this): thread runs forever
-                            //     pulling from media_rx, silently drops frames
-                            //     if appsrc is dead. If appsrc recovers (state
-                            //     transition finishes), sends succeed again
-                            //     and the stream resumes. If it's permanently
-                            //     dead, segment-watchdog (external) bounces
-                            //     neolink — which is the correct authority
-                            //     for that decision, since we can't distinguish
-                            //     "transient" from "permanent" from inside
-                            //     this thread anyway.
+                            // Thread lifecycle: drop the frame and keep going
+                            // on transient send errors, but EXIT after EOS so
+                            // the next client connection rebuilds cleanly via
+                            // the factory callback.
+                            //
+                            // Why this matters for camera B (Reolink Elite WiFi
+                            // panorama): the camera's BC connection ping-times-
+                            // out every ~50s (WiFi/CPU saturation on the
+                            // 5120x1552 stream). During the 5s reconnect, no
+                            // frames flow → Frigate's ffmpeg RTSP read times
+                            // out → it disconnects → SuspendMode::Reset
+                            // unprepares the shared media → all appsrcs are
+                            // detached from the bin → bus() returns None →
+                            // every push_buffer fails with "App source is
+                            // closed" forever. EOS at 100 errors triggers
+                            // Frigate to respawn ffmpeg, which DOES create a
+                            // new RTSP session and a new factory callback
+                            // (confirmed in logs by counter resets to #1).
+                            // But without this exit, the OLD thread keeps
+                            // looping forever as a zombie, pumping into dead
+                            // appsrcs, and N rebuild cycles produce N parallel
+                            // zombie threads — all generating "send error"
+                            // log spam, all holding stale media_rx + BC
+                            // start_video subscriptions on the camera.
+                            //
+                            // Exit story by version:
+                            //   - Exiting on first error (original): dead
+                            //     thread, dead pipeline, hours-long wedges.
+                            //     Wrong because transient state-transition
+                            //     errors are common during pipeline pause.
+                            //   - Exiting on N=500 (e3a0ec4): assumed a new
+                            //     client would reconnect; but if EOS isn't
+                            //     fired, the connected client never sees a
+                            //     stream end and never reconnects.
+                            //   - Never exit (b020970, 932d682): broke
+                            //     camera B because of zombie accumulation
+                            //     described above.
+                            //   - Exit AFTER EOS + brief grace (this):
+                            //     transient errors still tolerated indefinitely
+                            //     (no exit unless EOS_THRESHOLD hit AND grace
+                            //     elapses), but once EOS is fired and the
+                            //     appsrcs are confirmed-detached, the thread
+                            //     exits — closing media_rx, ending the
+                            //     upstream BC start_video subscription, and
+                            //     letting the factory rebuild fresh on
+                            //     Frigate's ffmpeg respawn. No more zombies.
+                            //
+                            // If EOS does not actually cause a client to
+                            // reconnect (e.g. eos_shutdown=false on the
+                            // factory plus a client that ignores EOS), the
+                            // stream stays dead until segment-watchdog
+                            // (external) bounces neolink — same fallback as
+                            // before, no regression.
                             let mut consecutive_errors: u32 = 0;
-                            // One-shot per cascade: fire EOS once when we
-                            // cross EOS_THRESHOLD, don't spam. Reset on
-                            // successful send so a future cascade can retry.
                             let mut eos_signaled = false;
                             // 100 consecutive errors at 20fps ≈ 5s of sustained
                             // failure. Transient state transitions clear in
                             // well under a second, so this threshold is
                             // comfortably past "transient" territory.
                             const EOS_THRESHOLD: u32 = 100;
+                            // After EOS, give the pipeline ~2.5s to either
+                            // recover (rare) or fully tear down before exiting.
+                            // 50 frames at 20fps. If we exit IMMEDIATELY after
+                            // EOS, we risk the new client's create_element
+                            // callback racing with our thread teardown (the
+                            // outer ClientMsg::NewClient handler is async; if
+                            // it sees the rx side of media_rx still open
+                            // briefly, the new thread spawns first). Empirically
+                            // a ~2.5s grace is plenty.
+                            const POST_EOS_GRACE: u32 = 50;
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
@@ -293,6 +343,24 @@ pub(super) async fn make_factory(
 
                             log::trace!("{name}::{stream}: Sending new frames");
                             while let Some(data) = media_rx.blocking_recv() {
+                                // Stamp arrival BEFORE the push attempt: this
+                                // is the per-frame liveness signal the
+                                // camthread ping watchdog reads. Even if the
+                                // push itself fails (e.g. appsrc detached
+                                // mid-rebuild), the fact that BcMedia is
+                                // arriving on media_rx proves the BC
+                                // connection is alive and the camera is
+                                // streaming. We want the watchdog to see
+                                // that, NOT to be tied to whether a downstream
+                                // gstreamer appsrc is currently consuming.
+                                let is_video_frame = matches!(
+                                    data,
+                                    BcMedia::Iframe(_) | BcMedia::Pframe(_)
+                                );
+                                if is_video_frame {
+                                    frame_pump_last_frame_at
+                                        .store(now_epoch_ms(), Ordering::Relaxed);
+                                }
                                 match send_to_sources(
                                     data,
                                     &mut pools,
@@ -318,31 +386,20 @@ pub(super) async fn make_factory(
                                         // during a sustained outage.
                                         if consecutive_errors.is_power_of_two() {
                                             log::info!(
-                                                "{name}::{stream}: send error #{consecutive_errors} (dropping frame, thread continues): {e:?}"
+                                                "{name}::{stream}: send error #{consecutive_errors} (dropping frame): {e:?}"
                                             );
                                         }
                                         // Layer 2 self-recovery: at sustained
                                         // failure, proactively EOS the appsrcs
-                                        // to force the shared pipeline to tear
-                                        // down. Connected clients disconnect
-                                        // (including Frigate's persistent
-                                        // go2rtc); their reconnect triggers
-                                        // the factory callback → fresh media
-                                        // → fresh frame-pump thread. Without
-                                        // this, Frigate's persistent TCP
-                                        // connection prevents the last-client-
-                                        // disconnect event that SuspendMode::
-                                        // Reset needs to rebuild — and the
-                                        // stream wedges until segment-watchdog
-                                        // bounces us externally (~2min).
-                                        // EOS is no-op on truly-dead appsrcs;
-                                        // in that case we fall back to the
-                                        // watchdog as before.
+                                        // to force connected clients to
+                                        // disconnect+reconnect, which triggers
+                                        // a fresh factory callback → fresh
+                                        // pipeline → fresh thread.
                                         if consecutive_errors == EOS_THRESHOLD
                                             && !eos_signaled
                                         {
                                             log::warn!(
-                                                "{name}::{stream}: {EOS_THRESHOLD} consecutive errors — signaling EOS to force pipeline rebuild"
+                                                "{name}::{stream}: {EOS_THRESHOLD} consecutive errors — signaling EOS and exiting thread to force rebuild"
                                             );
                                             if let Some(src) = vid_src.as_ref() {
                                                 let _ = src.end_of_stream();
@@ -352,10 +409,26 @@ pub(super) async fn make_factory(
                                             }
                                             eos_signaled = true;
                                         }
+                                        // Exit after EOS+grace so this
+                                        // (now-doomed) thread doesn't
+                                        // accumulate as a zombie alongside
+                                        // the rebuilt thread. Dropping
+                                        // media_rx here closes the upstream
+                                        // BC subscription chain, freeing the
+                                        // camera-side start_video resources.
+                                        if eos_signaled
+                                            && consecutive_errors
+                                                >= EOS_THRESHOLD + POST_EOS_GRACE
+                                        {
+                                            log::info!(
+                                                "{name}::{stream}: exiting frame-pump thread after EOS — factory callback will rebuild on next client connect"
+                                            );
+                                            break;
+                                        }
                                     }
                                 }
                             }
-                            log::trace!("All media recieved");
+                            log::trace!("{name}::{stream}: frame-pump thread done");
                             AnyResult::Ok(())
                         });
                         AnyResult::Ok(())

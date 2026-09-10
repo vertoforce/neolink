@@ -6,7 +6,7 @@
 //! whenever the camera is lost/updated
 use anyhow::{anyhow, Context};
 use futures::TryFutureExt;
-use std::sync::{Arc, Weak};
+use std::sync::{atomic::AtomicU64, Arc, Weak};
 use tokio::{
     sync::{
         mpsc::Sender as MpscSender, oneshot::channel as oneshot, watch::Receiver as WatchReceiver,
@@ -279,6 +279,19 @@ impl NeoInstance {
         let (instance_tx, instance_rx) = oneshot();
         self.camera_control
             .send(NeoCamCommand::GetPermit(instance_tx))
+            .await?;
+        Ok(instance_rx.await?)
+    }
+
+    /// Retrieve the shared `last_frame_at` cell (epoch millis).
+    ///
+    /// The rtsp factory's frame-pump should `store(now_epoch_ms)` on every
+    /// successful `push_buffer` so the camthread ping watchdog can decide
+    /// whether to honor a ping timeout.
+    pub(crate) async fn last_frame_at(&self) -> Result<Arc<AtomicU64>> {
+        let (instance_tx, instance_rx) = oneshot();
+        self.camera_control
+            .send(NeoCamCommand::GetLastFrameAt(instance_tx))
             .await?;
         Ok(instance_rx.await?)
     }
