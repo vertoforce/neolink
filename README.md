@@ -1,43 +1,140 @@
-# Neolink
+# Fork of neolink with stability and bug fixes
 
-![CI](https://github.com/QuantumEntangledAndy/neolink/workflows/CI/badge.svg)
-[![dependency status](https://deps.rs/repo/github/QuantumEntangledAndy/neolink/status.svg)](https://deps.rs/repo/github/QuantumEntangledAndy/neolink)
+Neolink bridges Reolink cameras that only speak the Baichuan protocol (port 9000) to RTSP clients like Frigate, Shinobi and Blue Iris.
 
-Neolink is a small program that acts as a proxy between Reolink IP cameras and
-normal RTSP clients.
-Certain cameras, such as the Reolink B800, do not implement ONVIF or RTSP, but
-instead use a proprietary "Baichuan" protocol only compatible with their apps
-and NVRs (any camera that uses "port 9000" will likely be using this protocol).
-Neolink allows you to use NVR software such as Shinobi or Blue Iris to receive
-video from these cameras instead.
-The Reolink NVR is not required, and the cameras are unmodified.
-Your NVR software connects to Neolink, which forwards the video stream from the
-camera.
+## Why this fork
 
-The Neolink project is not affiliated with Reolink in any way; everything it
-does has been reverse engineered.
+Upstream has had no commit since 2025-01-30 and its open pull requests are unreviewed.
 
-## This Fork
+Run 24/7, upstream leaks memory and file descriptors and wedges in ways no watchdog sees.
 
-This fork is an extension of
-[thirtythreeforty's](https://github.com/thirtythreeforty/neolink) with additional
-features not yet in upstream master.
+This fork is upstream master plus four open pull requests taken verbatim, plus our own fixes below, each traced to a root cause against a real camera and checked base-versus-fixed in simulation.
 
-**Major Features**:
+## Architecture
 
-- MQTT
-- Motion Detection
-- Paused Streams (when no rtsp client or no motion detected)
-- Save a still image to disk
+Before (upstream):
 
-**Minor Features**:
+```
+                    per RTSP client, a whole new stack
+                 +------------------------------------------+
+   camera -----> | BC session -> pump -> appsrc -> pipeline  | --> client 1
+          -----> | BC session -> pump -> appsrc -> pipeline  | --> client 2
+          -----> | BC session -> pump -> appsrc -> pipeline  | --> ffprobe
+                 +------------------------------------------+
+                        ^                  ^
+                        |          new BufferPool per frame
+                  BC ping only          (one socketpair per frame)
 
-- Improved error messages when missing gstreamer plugins
-- Protocol more closely follows official reolink format
-  - Possibly can handle more simulatenous connections
-- More ways to connect to the camera. Including Relaying through reolink
-  servers
-- Camera battery levels can be displayed in the log
+   liveness:  BC ping only              (blind to frames stopping)
+   sessions:  never closed on expiry    (client blocks on read forever)
+   DESCRIBE:  waits forever             (one dead camera freezes all)
+   result:    RSS and FDs climb until OOM
+```
+
+After (this fork), the simple path:
+
+```
+                 +---------------------------------------------+
+   camera -----> | BC session -> MPEG-TS muxer -> stdout        | --> go2rtc exec:
+                 +---------------------------------------------+
+                   exit 0 on stdout close, non-zero on no frames;
+                   the supervisor respawns, nothing else to watch
+```
+
+After (this fork), the RTSP path kept for multi-client setups:
+
+```
+                       one shared pipeline per camera
+                 +---------------------------------------------+
+   camera -----> | BC session -> pump -> appsrc -> pipeline ->  | --> client 1
+                 |                (drop oldest)           pay0  | --> client 2
+                 +---------------------------------------------+
+                        ^            ^                  ^
+                  frame-arrival   bucketed pools   egress watchdog
+                  watchdog 30 s   1 MB max         15 s on pay0
+                        |                               |
+                        +-----------> EOS <-------------+
+                                       |
+                        reap session, close client TCP,
+                        rebuild within an 8 s bound
+```
+
+The RTSP path is not simpler than upstream, it is the same structure with less state per client and watchdogs that turn every silent stall into a rebuild.
+
+The pipe path is simpler than both: one process per camera and the supervisor is the only watchdog.
+
+## Fixes
+
+"Verified" means the fix ran in production against four cameras with the symptom gone.
+
+| Fix | Symptom | Upstream issues | Status |
+|---|---|---|---|
+| Shared pipeline per camera ([#400](https://github.com/QuantumEntangledAndy/neolink/pull/400) by [@joshkautz](https://github.com/joshkautz), verbatim) | Every client opened its own pipeline and camera session, so FDs and memory grew per connect. | [#202](https://github.com/QuantumEntangledAndy/neolink/issues/202), [#215](https://github.com/QuantumEntangledAndy/neolink/issues/215), [#286](https://github.com/QuantumEntangledAndy/neolink/issues/286), [#366](https://github.com/QuantumEntangledAndy/neolink/issues/366), [#370](https://github.com/QuantumEntangledAndy/neolink/issues/370), [#380](https://github.com/QuantumEntangledAndy/neolink/issues/380) | Verified |
+| Bucketed buffer pools ([#373](https://github.com/QuantumEntangledAndy/neolink/pull/373) by [@wafgo](https://github.com/wafgo), verbatim) | A new buffer pool per frame meant a new socketpair per frame, 2.8 MB/s growth until OOM. | [#202](https://github.com/QuantumEntangledAndy/neolink/issues/202), [#286](https://github.com/QuantumEntangledAndy/neolink/issues/286), [#366](https://github.com/QuantumEntangledAndy/neolink/issues/366), [#370](https://github.com/QuantumEntangledAndy/neolink/issues/370), [#380](https://github.com/QuantumEntangledAndy/neolink/issues/380), [#382](https://github.com/QuantumEntangledAndy/neolink/issues/382), [#411](https://github.com/QuantumEntangledAndy/neolink/issues/411) | Verified |
+| Non-blocking channel sends ([#399](https://github.com/QuantumEntangledAndy/neolink/pull/399) by [@joshkautz](https://github.com/joshkautz), verbatim, plus subscriber depth 1000) | A full channel blocked the message loop, pings went unanswered and the camera dropped the session ("Reaching limit of channel"). | [#143](https://github.com/QuantumEntangledAndy/neolink/issues/143), [#215](https://github.com/QuantumEntangledAndy/neolink/issues/215), [#286](https://github.com/QuantumEntangledAndy/neolink/issues/286), [#315](https://github.com/QuantumEntangledAndy/neolink/issues/315), [#346](https://github.com/QuantumEntangledAndy/neolink/issues/346), [#349](https://github.com/QuantumEntangledAndy/neolink/issues/349), [#366](https://github.com/QuantumEntangledAndy/neolink/issues/366) | Verified |
+| 64-bit timestamps ([#398](https://github.com/QuantumEntangledAndy/neolink/pull/398) by [@joshkautz](https://github.com/joshkautz), verbatim) | The 32-bit microsecond counter wrapped every 71.58 minutes and froze the stream. | [#209](https://github.com/QuantumEntangledAndy/neolink/issues/209), [#378](https://github.com/QuantumEntangledAndy/neolink/issues/378) | Verified |
+| Never suspend the shared pipeline on client churn | A client leaving set the shared pipeline to NULL and egress stopped for everyone. Diagnosed on gst-rtsp-server 1.22. It does not trigger on gst-rtsp-server 1.26.2, where client churn never calls `gst_rtsp_media_suspend`, and is kept as a no-op safety. | none verified | Unconfirmed |
+| Drop oldest frame under back-pressure | The newest frame was dropped instead, so latency grew to minutes. | [#209](https://github.com/QuantumEntangledAndy/neolink/issues/209), [#290](https://github.com/QuantumEntangledAndy/neolink/issues/290), [#310](https://github.com/QuantumEntangledAndy/neolink/issues/310), [#315](https://github.com/QuantumEntangledAndy/neolink/issues/315), [#349](https://github.com/QuantumEntangledAndy/neolink/issues/349), [#360](https://github.com/QuantumEntangledAndy/neolink/issues/360), [#378](https://github.com/QuantumEntangledAndy/neolink/issues/378) | Verified |
+| Frame-arrival watchdog | A camera that stopped sending frames was never noticed while its pings still answered. | none verified | Verified |
+| Frame pump survives transient errors | One "App source is closed" killed the delivery thread for hours. | [#310](https://github.com/QuantumEntangledAndy/neolink/issues/310), [#315](https://github.com/QuantumEntangledAndy/neolink/issues/315), [#346](https://github.com/QuantumEntangledAndy/neolink/issues/346), [#349](https://github.com/QuantumEntangledAndy/neolink/issues/349), [#360](https://github.com/QuantumEntangledAndy/neolink/issues/360) | Verified |
+| Bounded 8 s pipeline build | One camera mid-reconnect froze the RTSP server for every camera. | [#360](https://github.com/QuantumEntangledAndy/neolink/issues/360) | Verified |
+| Stale-session reap and client kick | Expired sessions never closed the client's TCP connection, so it blocked on read forever. | [#164](https://github.com/QuantumEntangledAndy/neolink/issues/164), [#315](https://github.com/QuantumEntangledAndy/neolink/issues/315), [#346](https://github.com/QuantumEntangledAndy/neolink/issues/346) | Verified |
+| Poller busy-spin fix | After a disconnect the poller re-entered a closed channel and pegged a core at 100%. The spin is reproduced at mechanism level, 644,000 re-entries in 200 ms on the base build against one return on the fixed build. | [#215](https://github.com/QuantumEntangledAndy/neolink/issues/215), [#290](https://github.com/QuantumEntangledAndy/neolink/issues/290), [#320](https://github.com/QuantumEntangledAndy/neolink/issues/320), [#380](https://github.com/QuantumEntangledAndy/neolink/issues/380), [#390](https://github.com/QuantumEntangledAndy/neolink/issues/390) | Verified (mechanism) |
+| Frame-starvation exit | After a reconnect the pump waited forever while dead media was served to new clients. | [#209](https://github.com/QuantumEntangledAndy/neolink/issues/209), [#346](https://github.com/QuantumEntangledAndy/neolink/issues/346) | Verified |
+| Dead-camera DESCRIBE gate | A powered-off camera was served a DESCRIBE and returned dead media, and the gate serves 0 of 10 DESCRIBEs against 4 of 10 without it. The `get_rates` assert that aborted the process is fixed by gst-rtsp-server 1.26.2 itself (gstreamer MR !7731), so only the DESCRIBE liveness gate is ours. | [#215](https://github.com/QuantumEntangledAndy/neolink/issues/215), [#286](https://github.com/QuantumEntangledAndy/neolink/issues/286), [#370](https://github.com/QuantumEntangledAndy/neolink/issues/370) | Verified |
+| Orphan pump reaping | Each timed-out build leaked a thread, reaching 121 threads and 586 FDs in 72 h. | [#380](https://github.com/QuantumEntangledAndy/neolink/issues/380) | Verified |
+| Egress-liveness watchdog | The stall watchdog never saw fragmented frames, so it never armed on large streams. | [#346](https://github.com/QuantumEntangledAndy/neolink/issues/346) | Verified |
+
+The pull requests are unchanged from their authors' branches, so upstream can merge them as-is.
+
+## Which mode to use
+
+**`neolink stream`** for one local consumer per camera, such as go2rtc or Frigate:
+
+```yaml
+streams:
+  driveway:
+    - "exec:neolink stream --config /etc/neolink.toml driveway --stream main --format ts"
+```
+
+One process, one camera, MPEG-TS on stdout, no RTSP server.
+
+It exits 0 when the consumer closes stdout and non-zero when frames stop, so the supervisor's respawn replaces every in-process watchdog.
+
+Measured side by side with RTSP on the same camera: same cadence, zero dropped frames in a CFR re-encode, 32 MB and 10 FDs versus 73 MB and 37, and 10 s recovery from a 40 s link cut.
+
+**`neolink rtsp`** for several clients per camera, or clients you do not control.
+
+Audio works on both paths. The pipe path carries a camera's AAC track in the MPEG-TS stream. When a camera sends ADPCM instead, it transcodes to AAC through `voaacenc`. That transcode is covered by unit tests over a captured ADPCM block, not by a live ADPCM camera.
+
+Caveat: the pipe path's longest soak is 20 minutes against months for RTSP, and cold start is 4.4 s per respawn.
+
+## Docker
+
+```bash
+docker build -t neolink:fork .
+```
+
+The base is Debian trixie with gst-rtsp-server 1.26.2, which removed the assert that let a dead camera abort the process (gstreamer !7731).
+
+The build fails on purpose if the runtime library is older than 1.24.9.
+
+`Dockerfile.ab-bookworm-stock` is a test-only control image. Do not deploy it.
+
+## Verification
+
+- `iso-test/sim/verify.sh` is the entrypoint. `--quick` runs the unit tier alone, and no flag runs the container scenarios and the A/B arms as well, ending in a PASS/FAIL table.
+- `cargo test --release --workspace`: timestamp wrap and reset, monotonicity, audio re-anchor, MPEG-TS muxer. 119 tests green, 68 in neolink, 49 in neolink_core and 2 doc, up from 54 on the upstream-plus-PRs base.
+- `.github/workflows/ci.yml` runs the unit tier and clippy on every push and pull request. It builds the same Debian trixie image the release binary is built in.
+- `iso-test/` and `iso-test/sim/` are the A/B harnesses. Each builds a "base" tree with the fix reverted and a "fixed" tree, then asserts the measured difference.
+- `iso-test/sim/` drives each wedge mode from the fix table and asserts the matching watchdog fires.
+- Fix-table status: 14 rows Verified, 1 row Unconfirmed.
+
+"Verified" in the fix table is a production observation, not a simulation result. The simulation results are a second, independent line of evidence.
+
+## Upstream
+
+Tracks [QuantumEntangledAndy/neolink](https://github.com/QuantumEntangledAndy/neolink), itself a fork of [thirtythreeforty/neolink](https://github.com/thirtythreeforty/neolink). Everything below is upstream documentation, unchanged.
 
 ## Installation
 
