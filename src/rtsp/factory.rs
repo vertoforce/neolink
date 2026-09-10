@@ -451,8 +451,14 @@ pub(super) async fn make_factory(
                     let rtsp = rtsp.clone();
                     let paths = paths.clone();
                     let pipeline_generation = pipeline_generation.clone();
-                    let my_generation =
-                        pipeline_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                    // fix 16: the generation is bumped INSIDE the build task,
+                    // only once the bin has actually been handed to
+                    // gst-rtsp-server (reply.send succeeded). Bumping here, at
+                    // request time (pre-fix16), meant a build that later
+                    // timed out / was abandoned / discarded still incremented
+                    // the counter — so the currently SERVING pump was no
+                    // longer the newest generation and its terminal exit
+                    // silently skipped the fix 9 zombie-client kick.
                     tokio::task::spawn(async move {
                         clear_bin(&element)?;
                         log::trace!("{name}::{stream}: Starting camera");
@@ -558,19 +564,45 @@ pub(super) async fn make_factory(
                         // to the shared media here; the payloader src pad is the
                         // closest observable boundary the crate gives us.
                         let egress_count = Arc::new(AtomicU64::new(0));
+                        // fix 16: the payloader element, kept for the pump's
+                        // PLAYING gate. NOT the appsrc: send_to_appsrc's
+                        // back-pressure logic deliberately toggles the appsrc
+                        // element between PAUSED (queue < 1/3) and PLAYING
+                        // (queue > 2/3), so appsrc state says nothing about
+                        // whether a client is playing; pay0 follows the media
+                        // pipeline's state (PAUSED when merely prepared/cached,
+                        // PLAYING while >= 1 client PLAYs).
+                        let mut pay0_for_pump: Option<Element> = None;
                         {
                             let bin = element
                                 .clone()
                                 .dynamic_cast::<Bin>()
                                 .map_err(|_| anyhow!("pipeline element should be a bin"))?;
                             if let Some(pay0) = bin.by_name("pay0") {
+                                pay0_for_pump = Some(pay0.clone());
                                 if let Some(srcpad) = pay0.static_pad("src") {
                                     let egress_count_probe = egress_count.clone();
+                                    // fix 16: BUFFER | BUFFER_LIST. rtph264pay /
+                                    // rtph265pay push a frame that fragments into
+                                    // several RTP packets as ONE GstBufferList, and a
+                                    // BUFFER-only probe is never called for lists — so
+                                    // on every pipeline whose frames exceed the MTU
+                                    // (all four of ours, iso-measured 2026-08-28) this
+                                    // counter stayed at 0 forever and the egress-stall
+                                    // + fix 13 starvation exits could never arm. Count
+                                    // the list's packets so the counter is "RTP
+                                    // packets egressed" in both cases.
                                     let _ = srcpad.add_probe(
-                                        gstreamer::PadProbeType::BUFFER,
-                                        move |_pad, _info| {
-                                            egress_count_probe
-                                                .fetch_add(1, Ordering::Relaxed);
+                                        gstreamer::PadProbeType::BUFFER
+                                            | gstreamer::PadProbeType::BUFFER_LIST,
+                                        move |_pad, info| {
+                                            let n = match info.data {
+                                                Some(gstreamer::PadProbeData::BufferList(
+                                                    ref list,
+                                                )) => list.len().max(1) as u64,
+                                                _ => 1,
+                                            };
+                                            egress_count_probe.fetch_add(n, Ordering::Relaxed);
                                             gstreamer::PadProbeReturn::Ok
                                         },
                                     );
@@ -617,6 +649,10 @@ pub(super) async fn make_factory(
                             );
                             return AnyResult::Ok(());
                         }
+                        // fix 16: this pipeline now exists for gst-rtsp-server;
+                        // it supersedes every earlier pump for this stream.
+                        let my_generation =
+                            pipeline_generation.fetch_add(1, Ordering::SeqCst) + 1;
 
                         // Run blocking code on a seperate thread
                         // This is not an async thread
@@ -852,6 +888,27 @@ pub(super) async fn make_factory(
                                 {
                                     let egress_now = egress_count_pump.load(Ordering::Relaxed);
                                     let now_ms = now_epoch_ms();
+                                    // fix 16: the egress-stall and starvation
+                                    // exits only make sense for a pipeline that
+                                    // is actually PLAYING for a client. Once the
+                                    // pay0 probe really counts (BUFFER_LIST), a
+                                    // cached shared media left PAUSED by a
+                                    // DESCRIBE-only client (ffprobe health
+                                    // check, consumer that died before PLAY)
+                                    // looks like an egress stall — frames arrive,
+                                    // the leaky appsrc queue absorbs them, pay0
+                                    // stops after preroll — and EOS'ing it with
+                                    // no client attached leaves a dead media in
+                                    // the factory cache that every later
+                                    // DESCRIBE reuses (the fix 14 post-EOS
+                                    // corpse class; create_element never runs
+                                    // for a cache hit). PAUSED cached media is
+                                    // legitimate and reusable; leave it alone.
+                                    // State is read from pay0 (see pay0_for_pump),
+                                    // never from the appsrc.
+                                    let playing = pay0_for_pump.as_ref().is_some_and(|p| {
+                                        p.current_state() == gstreamer::State::Playing
+                                    });
                                     if egress_eos_at != 0 {
                                         // We already fired the egress EOS; wait
                                         // out the grace window then exit. We own
@@ -872,9 +929,19 @@ pub(super) async fn make_factory(
                                     } else if egress_now > egress_last_count {
                                         // Bytes are leaving toward the client —
                                         // healthy. (Re)arm the clock.
+                                        if egress_last_at == 0 {
+                                            // fix 16 observability: one line per
+                                            // pipeline when the egress watchdogs
+                                            // arm (this never printed on
+                                            // buffer-list pipelines before).
+                                            log::info!(
+                                                "{name}::{stream}: RTSP egress started ({egress_now} RTP packets) — egress-stall + starvation watchdogs armed"
+                                            );
+                                        }
                                         egress_last_count = egress_now;
                                         egress_last_at = now_ms;
                                     } else if data.is_some()
+                                        && playing
                                         && egress_last_at != 0
                                         && now_ms.saturating_sub(egress_last_at)
                                             > egress_staleness_ms
@@ -911,6 +978,7 @@ pub(super) async fn make_factory(
                                         eos_signaled = true;
                                         egress_eos_at = now_ms;
                                     } else if egress_last_at != 0
+                                        && playing
                                         && now_ms
                                             .saturating_sub(last_camera_frame_ms)
                                             >= crate::common::FRAME_STALENESS_MS
