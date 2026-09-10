@@ -67,6 +67,28 @@ impl NeoRtspServer {
                 //   connections without shutting down old ones)
                 session.set_timeout(30);
             });
+            // Proactive session reap on TCP close. Without this, when a
+            // client's TCP connection drops without a TEARDOWN (common with
+            // ffmpeg processes that exit on rw_timeout, with kill, or with
+            // socket reset), the session lingers in the pool until its
+            // 30s timeout expires. During that window the gst-rtsp-server
+            // still counts the session as an active consumer of the shared
+            // media — observed symptom is CLOSE_WAIT accumulation on :8554
+            // (measured 7 stuck sessions / 7min uptime on 2026-05-20) plus
+            // shared-pipeline back-pressure even when no real client is
+            // draining. Forcing Remove here on `closed` collapses the
+            // zombie window to ~0.
+            client.connect_closed(|client| {
+                let removed = client.session_filter(Some(&mut |_client, _session| {
+                    RTSPFilterResult::Remove
+                }));
+                if !removed.is_empty() {
+                    log::info!(
+                        "RTSP client closed — reaped {} session(s) immediately",
+                        removed.len()
+                    );
+                }
+            });
         });
 
         Ok(factory)
@@ -113,7 +135,10 @@ impl NeoRtspServer {
                         RTSPFilterResult::Keep
                     }));
                 }
-                std::thread::sleep(Duration::from_secs(5));
+                // 2s sweep handles the residual case where `closed` didn't
+                // fire (e.g. client TCP RST without protocol close); the
+                // closed-signal hook covers the common path.
+                std::thread::sleep(Duration::from_secs(2));
             }
             AnyResult::Ok(())
         });

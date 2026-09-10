@@ -311,12 +311,34 @@ pub(super) async fn make_factory(
                             // (external) bounces neolink — same fallback as
                             // before, no regression.
                             let mut consecutive_errors: u32 = 0;
+                            // Sibling counter for sustained back-pressure
+                            // (push_buffer returning Flushing). Unlike
+                            // consecutive_errors, the push call itself
+                            // SUCCEEDS — but the appsrc queue is full because
+                            // the RTSP consumer isn't draining. Without a
+                            // counter the EOS-on-errors path never fires for
+                            // this failure mode, and the stream silently
+                            // wedges until external intervention. Observed
+                            // mode: post-restart, frames flow into appsrc,
+                            // "Buffer full pausing" loops forever, downstream
+                            // ffmpeg sits in poll() forever (especially when
+                            // it lacks a socket -timeout), no client churn,
+                            // no factory rebuild. See `SendOutcome` plumbing
+                            // in send_to_appsrc / send_to_sources.
+                            let mut consecutive_backpressure: u32 = 0;
                             let mut eos_signaled = false;
                             // 100 consecutive errors at 20fps ≈ 5s of sustained
                             // failure. Transient state transitions clear in
                             // well under a second, so this threshold is
                             // comfortably past "transient" territory.
                             const EOS_THRESHOLD: u32 = 100;
+                            // Back-pressure tolerates more before firing —
+                            // a slow consumer that briefly falls behind is
+                            // normal. ~20s at 20fps. A genuinely stuck
+                            // consumer holds Flushing indefinitely, so the
+                            // distinction between "slow" and "wedged" is
+                            // measured in seconds, not milliseconds.
+                            const BACKPRESSURE_EOS_THRESHOLD: u32 = 400;
                             // After EOS, give the pipeline ~2.5s to either
                             // recover (rare) or fully tear down before exiting.
                             // 50 frames at 20fps. If we exit IMMEDIATELY after
@@ -370,14 +392,52 @@ pub(super) async fn make_factory(
                                     &mut aud_ts,
                                     &stream_config,
                                 ) {
-                                    Ok(()) => {
+                                    Ok(SendOutcome::Sent) => {
                                         if consecutive_errors > 0 {
                                             log::info!(
                                                 "{name}::{stream}: send recovered after {consecutive_errors} errors"
                                             );
                                         }
+                                        if consecutive_backpressure > 0 {
+                                            log::info!(
+                                                "{name}::{stream}: back-pressure recovered after {consecutive_backpressure} blocked pushes"
+                                            );
+                                        }
                                         consecutive_errors = 0;
+                                        consecutive_backpressure = 0;
                                         eos_signaled = false;
+                                    }
+                                    Ok(SendOutcome::BackPressured) => {
+                                        consecutive_backpressure += 1;
+                                        // Same Layer-2 recovery as the error
+                                        // path: if back-pressure persists past
+                                        // BACKPRESSURE_EOS_THRESHOLD, the
+                                        // consumer is wedged. Signal EOS to
+                                        // force client disconnect → factory
+                                        // rebuild on next connect.
+                                        if consecutive_backpressure == BACKPRESSURE_EOS_THRESHOLD
+                                            && !eos_signaled
+                                        {
+                                            log::warn!(
+                                                "{name}::{stream}: {BACKPRESSURE_EOS_THRESHOLD} consecutive back-pressured pushes — consumer stuck, signaling EOS and exiting thread to force rebuild"
+                                            );
+                                            if let Some(src) = vid_src.as_ref() {
+                                                let _ = src.end_of_stream();
+                                            }
+                                            if let Some(src) = aud_src.as_ref() {
+                                                let _ = src.end_of_stream();
+                                            }
+                                            eos_signaled = true;
+                                        }
+                                        if eos_signaled
+                                            && consecutive_backpressure
+                                                >= BACKPRESSURE_EOS_THRESHOLD + POST_EOS_GRACE
+                                        {
+                                            log::info!(
+                                                "{name}::{stream}: exiting frame-pump thread after back-pressure EOS — factory callback will rebuild on next client connect"
+                                            );
+                                            break;
+                                        }
                                     }
                                     Err(e) => {
                                         consecutive_errors += 1;
@@ -451,6 +511,18 @@ pub(super) async fn make_factory(
     Ok((factory, thread))
 }
 
+/// Outcome of a push into a single appsrc, or the aggregate result of a
+/// send_to_sources call. Used by the frame-pump thread to distinguish a
+/// healthy push from sustained back-pressure (push_buffer returning
+/// Flushing). The Sent/BackPressured distinction drives the back-pressure
+/// EOS watchdog — without it, a stuck downstream consumer wedges silently
+/// because push_buffer→Flushing is not an Err.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendOutcome {
+    Sent,
+    BackPressured,
+}
+
 fn send_to_sources(
     data: BcMedia,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
@@ -459,7 +531,11 @@ fn send_to_sources(
     vid_ts: &mut u64,
     aud_ts: &mut u64,
     stream_config: &StreamConfig,
-) -> AnyResult<()> {
+) -> AnyResult<SendOutcome> {
+    // Track whether ANY push in this call hit Flushing. The video path is
+    // the only one that drives back-pressure recovery — audio is dropped
+    // on near-full upstream so it can't generate sustained BackPressured.
+    let mut outcome = SendOutcome::Sent;
     // Update TS
     match data {
         BcMedia::Aac(aac) => {
@@ -472,7 +548,15 @@ fn send_to_sources(
                     log::debug!("Audio buffer near capacity, dropping AAC frame");
                 } else {
                     log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts));
-                    send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts), pools)?;
+                    if send_to_appsrc(
+                        aud_src,
+                        aac.data,
+                        Duration::from_micros(*aud_ts),
+                        pools,
+                    )? == SendOutcome::BackPressured
+                    {
+                        outcome = SendOutcome::BackPressured;
+                    }
                 }
             }
             *aud_ts += duration as u64;
@@ -487,7 +571,15 @@ fn send_to_sources(
                     log::debug!("Audio buffer near capacity, dropping ADPCM frame");
                 } else {
                     log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts));
-                    send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts), pools)?;
+                    if send_to_appsrc(
+                        aud_src,
+                        adpcm.data,
+                        Duration::from_micros(*aud_ts),
+                        pools,
+                    )? == SendOutcome::BackPressured
+                    {
+                        outcome = SendOutcome::BackPressured;
+                    }
                 }
             }
             *aud_ts += duration as u64;
@@ -510,7 +602,11 @@ fn send_to_sources(
                     log::debug!("Video buffer near capacity, dropping video frame");
                 } else {
                     log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
-                    send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?;
+                    if send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?
+                        == SendOutcome::BackPressured
+                    {
+                        outcome = SendOutcome::BackPressured;
+                    }
                 }
             }
             const MICROSECONDS: u64 = 1000000;
@@ -518,7 +614,7 @@ fn send_to_sources(
         }
         _ => {}
     }
-    Ok(())
+    Ok(outcome)
 }
 
 fn bucket_size_for(n: usize) -> Option<usize> {
@@ -590,7 +686,7 @@ fn send_to_appsrc(
     data: Vec<u8>,
     mut ts: std::time::Duration,
     pools: &mut std::collections::HashMap<usize, gstreamer::BufferPool>,
-) -> AnyResult<()> {
+) -> AnyResult<SendOutcome> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
     // In live mode we follow the advice in
@@ -605,12 +701,12 @@ fn send_to_appsrc(
             if matches!(appsrc.current_state(), gstreamer::State::Playing) {
                 ts = Duration::from_micros(time.useconds());
             } else {
-		// Not playing
-                return Ok(());
+		// Not playing — treat as a no-op, not back-pressure.
+                return Ok(SendOutcome::Sent);
             }
         } else {
-	    // Clock not up yet
-            return Ok(());
+	    // Clock not up yet — same.
+            return Ok(SendOutcome::Sent);
         }
     }
 
@@ -624,7 +720,7 @@ fn send_to_appsrc(
                 "Buffer full on {} pausing stream until client consumes frames",
                 appsrc.name()
             );
-            return Ok(());
+            return Ok(SendOutcome::BackPressured);
         }
         Err(e) => return Err(anyhow::anyhow!("Error in streaming: {e:?}")),
     }
@@ -638,7 +734,7 @@ fn send_to_appsrc(
         let _ = appsrc.set_state(gstreamer::State::Paused);
     }
 
-    Ok(())
+    Ok(SendOutcome::Sent)
 }
 
 fn check_live(app: &AppSrc) -> Result<()> {
