@@ -89,14 +89,22 @@ impl BcConnection {
         rx_thread.spawn(async move {
             tokio::select! {
                 _ = thread_cancel.cancelled() => Result::Ok(()),
-                v = async {
-                    loop {
-                        if let n @ Err(_) = poller.run().await {
-                            trace!("Polling has ended");
-                            return n;
-                        }
-                    }
-                }=> v
+                // fix 12: run the poller exactly once. Poller::run() is itself a
+                // loop over all commands that returns only on a terminal event:
+                // Err (Disconnect / decode failure) OR Ok(()) when its command
+                // receiver (poll_commanded) is permanently closed — i.e. every
+                // poll_commander sender has dropped and the BcConnection is being
+                // torn down. The old `loop { if Err => return }` re-invoked run()
+                // on Ok(()); once the receiver closed, run() returned Ok(())
+                // immediately every iteration → a tight busy-loop pegging one core
+                // at 100% (kempson's Frigate-LXC measurement; we carried the
+                // byte-identical bug), and this select's cancel arm could never
+                // preempt the hot inner future. A single call is complete: its
+                // result is the poller's final result.
+                v = poller.run() => {
+                    trace!("Polling has ended");
+                    v
+                }
             }
         });
 
