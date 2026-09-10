@@ -15,6 +15,15 @@
 # the dead-camera SIGABRT vector it guards (gst_rtsp_media_get_rates) lives on
 # the RTSP path, which pipe mode does not enter.
 #
+# 2026-09-10: pipe mode DOES now call GStreamer, for one thing only — the
+# ADPCM -> AAC transcode in src/stream/aac.rs (appsrc ! audioconvert !
+# audioresample ! voaacenc ! aacparse ! appsink). MPEG-TS has no ADPCM stream
+# type, so without it the muxer emits a video-only PMT and camera A + camera C
+# lose the audio the RTSP path used to carry. The plugin packages below are
+# therefore no longer incidental dependencies: `extract-stream-runtime.sh`
+# copies six specific plugin .so files out of this image, and the transcoder
+# refuses to advertise an audio track it cannot produce if they are absent.
+#
 # Build:  docker build -f Dockerfile.stream-bookworm -t neolink:stream1-bookworm .
 # Extract: ./extract-stream-runtime.sh
 FROM docker.io/rust:slim-bookworm@sha256:ebd900bae66fd508b466cef82d64a83a5fb34682e4c8b2797a42908bddc95a57 AS build
@@ -40,21 +49,44 @@ RUN apt-get update && \
     cargo build --release
 
 # Optional target: `docker build -f Dockerfile.stream-bookworm --target test .`
-# runs the 8 stream-module unit tests (4 in src/stream/mod.rs clock/wrap, 4 in
-# src/stream/mpegts.rs muxer) against the same compiled tree.
+# runs the 24 stream-module unit tests against the same compiled tree:
+# 8 clock/wrap/anchor/track-layout (src/stream/mod.rs), 4 muxer (mpegts.rs), 6 ADPCM decode
+# (adpcm.rs) and 6 AAC (aac.rs, including a real ADPCM -> voaacenc -> ADTS
+# encode, which is why the plugin packages are installed in this stage too).
 FROM build AS test
-RUN cargo test --release stream:: 2>&1 | tail -40
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+      gstreamer1.0-plugins-bad && \
+    apt-get clean -y && rm -rf /var/lib/apt/lists/*
+# `| tail` on its own would swallow a non-zero exit and silently pass a
+# failing test stage, so the log is captured and the status checked.
+RUN cargo test --release stream:: > /tmp/stream-tests.log 2>&1 \
+      || { tail -60 /tmp/stream-tests.log ; exit 1 ; } ; \
+    tail -30 /tmp/stream-tests.log
 
 FROM docker.io/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
+# The `for so in ...` guard fails the image rather than shipping a runtime the
+# transcoder cannot use. voaacenc is the only AAC encoder in bookworm's plugin
+# set (fdkaacenc is not built; avenc_aac lives in gstreamer1.0-libav, whose
+# libav* closure is an order of magnitude more to bind-mount into Frigate).
 # hadolint ignore=DL3008
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         openssl \
         ca-certificates \
         libgstrtspserver-1.0-0 \
-        libgstreamer1.0-0 && \
-    apt-get clean -y && rm -rf /var/lib/apt/lists/*
+        libgstreamer1.0-0 \
+        gstreamer1.0-plugins-base \
+        gstreamer1.0-plugins-good \
+        gstreamer1.0-plugins-bad && \
+    apt-get clean -y && rm -rf /var/lib/apt/lists/* ; \
+    for so in libgstapp libgstaudioconvert libgstaudioresample \
+              libgstaudioparsers libgstvoaacenc libgstcoreelements ; do \
+      test -f "/usr/lib/x86_64-linux-gnu/gstreamer-1.0/$so.so" \
+        || { echo "MISSING GStreamer plugin $so.so" >&2 ; exit 1 ; } ; \
+    done
 
 COPY --from=build \
   /usr/local/src/neolink/target/release/neolink \

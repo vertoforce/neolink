@@ -1,8 +1,43 @@
+//! DVI4/IMA ADPCM decoder for the pipe path.
+//!
+//! Provenance: this file is upstream neolink's `src/rtsp/adpcm.rs`, moved here
+//! by `git mv` on 2026-09-10. It was **dead code where it sat**:
+//! `src/rtsp/mod.rs` never declared `mod adpcm;`, and the `super::errors::Error`
+//! it returned names a `src/rtsp/errors.rs` that does not exist in this tree,
+//! so it could not have compiled. `neolink rtsp` decodes ADPCM with
+//! GStreamer's `adpcmdec` inside `pipe_adpcm()` and is unaffected by the move.
+//!
+//! ## What changed, and why it had to
+//!
+//! The nibble arithmetic is untouched. The framing was wrong for this caller
+//! and is rewritten:
+//!
+//! * It expected the **whole BC payload**, starting with the 4-byte sub-header
+//!   `00 01 <half_block_size:u16>`. `crates/core/.../de.rs::bcmedia_adpcm`
+//!   consumes those four bytes and hands out only what follows, so
+//!   `BcMediaAdpcm::data` begins at the predictor state and the old magic check
+//!   would have rejected every real frame. Verified against the checked-in
+//!   capture `crates/core/src/bcmedia/samples/adpcm_0.raw`: payload_size 248,
+//!   sub-header `00 01 7a 00`, `data` = 244 bytes = 4 predictor + 240 nibble
+//!   pairs.
+//! * `half_block_size` is not usable as a length. That same capture declares
+//!   `0x7a` = 122, i.e. 244/2 (the whole payload halved), while `ser.rs` writes
+//!   `(len - 4)/2` = 120 — de.rs already carries the comment "on some camera
+//!   this value is just 2". The block length now comes from the slice.
+//! * The block-length sanity check was `!bytes.len() % full_block_size == 0`,
+//!   which parses as `(!len) % n == 0` and rejected nothing, and divided by a
+//!   `full_block_size` it never checked for zero.
+//!
+//! Input is therefore one `BcMediaAdpcm::data`: a DVI4 block whose first two
+//! bytes are the previous output sample (LE `i16`) and whose next two are the
+//! step index (LE `u16`), followed by two 4-bit samples per byte. Output is
+//! little-endian S16 PCM, which is `audio/x-raw,format=S16LE` for the encoder
+//! in [`super::aac`].
+
 /*
  This is a rust implementation of OKI and DVI/IMA ADPCM.
 */
-use super::errors::Error;
-use log::error;
+use anyhow::{anyhow, Result};
 use std::convert::TryInto;
 
 struct AdpcmSetup {
@@ -85,71 +120,44 @@ impl Nibble {
     }
 }
 
-pub(crate) fn adpcm_to_pcm(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+pub(super) fn adpcm_to_pcm(bytes: &[u8]) -> Result<Vec<u8>> {
     let context = AdpcmSetup::new_ima();
 
     let mut result: Vec<u8> = vec![]; // Stores the PCM byte array
 
-    // ADPCM is not really a streamable format
-    // Each audio sample requires information on the previous sample
-    // To solve this reolink caches the intermediate variables (step_index and last_output)
-    // Into the block header in the stream. When ever an adpcm packet arrives it starts with
-    // 0x0001 which is the frame time from HISilicon documentation (I think) following by
-    // 0xWW which is half the block size
-    // 0xYY which is the last output
-    // 0xZZ which is the step index of the last output
-    // We must initialise our decoder with this data
-
-    if bytes.len() < 4 {
-        error!("ADPCM data is too short for even the magic.");
-        return Err(Error::AdpcmDecoding(
-            "ADPCM data is too short for even the magic.",
+    // ADPCM is not really a streamable format: each sample needs the state the
+    // previous one left behind. Reolink solves it by writing that state — the
+    // last output sample and the step index — into the head of every block, so
+    // a block can be decoded on its own. That is the DVI4 block header, and it
+    // is the first four bytes of `BcMediaAdpcm::data`.
+    const BLOCK_HEADER: usize = 4;
+    if bytes.len() <= BLOCK_HEADER {
+        return Err(anyhow!(
+            "ADPCM block of {} bytes carries no samples",
+            bytes.len()
         ));
     }
 
-    // Check for valid number of frame type
-    let frame_type_bytes = &bytes[0..2];
-    const FRAME_TYPE_HISILICON: &[u8] = &[0x00, 0x01];
-    if frame_type_bytes != FRAME_TYPE_HISILICON {
-        error!("Unexpected ADPCM frame type: {:x?}", frame_type_bytes);
-        return Err(Error::AdpcmDecoding("Unexpected ADPCM frame type"));
-    }
-
-    // Check for valid block size
-    let block_size_bytes = &bytes[2..4];
-    let block_size = (u16::from_le_bytes(
-        block_size_bytes
-            .try_into()
-            .expect("slice with incorrect length"),
-    ) as u32)
-        * 2; // Block size is stored as 1/2 (don't know why)
-    let full_block_size = block_size + 4; // block_size + magic (2 bytes) + size (2 bytes)
-    if !bytes.len() % full_block_size as usize == 0 {
-        error!("ADPCM Data is not a multiple of the block size");
-        return Err(Error::AdpcmDecoding(
-            "ADPCM block size does not match data length.",
-        ));
-    }
-
-    // Chunk on block size
-    for bytes in bytes.chunks(full_block_size as usize) {
-        // Get predictor state from block header using DVI 4 format.
-        if bytes.len() < 8 {
-            error!("ADPCM Block size is not long enough for header");
-            return Err(Error::AdpcmDecoding("ADPCM has insufficent block size"));
-        }
-        let step_output_bytes = &bytes[4..6];
+    {
+        // The one field that can be checked: the step index has to be a valid
+        // index into the step table. A frame that fails this is not a DVI4
+        // block, and decoding it would emit noise at full scale.
         let mut last_output = i16::from_le_bytes(
-            step_output_bytes
+            bytes[0..2]
                 .try_into()
                 .expect("slice with incorrect length"),
         ) as i32;
-        let step_index_bytes = &bytes[6..8];
         let mut step_index = u16::from_le_bytes(
-            step_index_bytes
+            bytes[2..4]
                 .try_into()
                 .expect("slice with incorrect length"),
         ) as i32;
+        if step_index > context.max_step_index as i32 {
+            return Err(anyhow!(
+                "ADPCM step index {step_index} is outside 0..={}",
+                context.max_step_index
+            ));
+        }
 
         // To avoid casting to u8 <-> u16 <-> u32 and back all the time I just do all maths in u/i32
         // This gives enough headroom to do all calculations without overflow because adpcm puts artifical
@@ -157,7 +165,7 @@ pub(crate) fn adpcm_to_pcm(bytes: &[u8]) -> Result<Vec<u8>, Error> {
         let mut step: u32;
 
         // The rest is all data to be decoded
-        let data = &bytes[8..];
+        let data = &bytes[BLOCK_HEADER..];
 
         for byte in data {
             let nibbles: [Nibble; 2] = Nibble::from_byte(byte);
@@ -242,4 +250,91 @@ pub(crate) fn adpcm_to_pcm(bytes: &[u8]) -> Result<Vec<u8>, Error> {
         }
     }
     Ok(result)
+}
+
+/// Build one BC-shaped ADPCM block: a DVI4 block header (previous output,
+/// step index) followed by `data_len` bytes of nibble pairs. This is the shape
+/// of `BcMediaAdpcm::data`, i.e. what the deserialiser hands us. Shared with
+/// [`super::aac`]'s end-to-end test.
+#[cfg(test)]
+pub(super) fn test_block(data_len: usize, fill: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + data_len);
+    out.extend_from_slice(&0i16.to_le_bytes()); // last_output
+    out.extend_from_slice(&0u16.to_le_bytes()); // step_index
+    out.resize(4 + data_len, fill);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_block as block;
+    use super::*;
+
+    fn peak(pcm: &[u8]) -> u16 {
+        pcm.chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]).unsigned_abs())
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn decodes_two_samples_per_byte() {
+        // 124 data bytes -> 248 samples -> 496 bytes of S16LE PCM.
+        let pcm = adpcm_to_pcm(&block(124, 0x35)).expect("decode");
+        assert_eq!(pcm.len(), 124 * 2 * 2);
+    }
+
+    #[test]
+    fn a_512_byte_block_is_1024_samples() {
+        // `BcMediaAdpcm::block_size()` is `data.len() - 4`, so a block of 512
+        // sample bytes arrives as 516 bytes of `data`.
+        let raw = block(512, 0x77);
+        assert_eq!(raw.len() - 4, 512);
+        assert_eq!(adpcm_to_pcm(&raw).expect("decode").len() / 2, 1024);
+    }
+
+    /// The one real ADPCM frame in the tree, decoded end to end.
+    ///
+    /// `crates/core/src/bcmedia/samples/adpcm_0.raw` is a whole BcMedia unit:
+    /// 4 byte magic, `payload_size` twice, then the 4 byte sub-header that
+    /// `de.rs` strips (`00 01` + a `half_block_size` of 0x7a, which is 244/2
+    /// and not the `(len-4)/2` = 120 that `ser.rs` writes — the field is why
+    /// the length is taken from the slice instead).
+    #[test]
+    fn the_checked_in_capture_decodes() {
+        const FRAME: &[u8] = include_bytes!("../../crates/core/src/bcmedia/samples/adpcm_0.raw");
+        let payload_size = usize::from(u16::from_le_bytes([FRAME[4], FRAME[5]]));
+        assert_eq!(payload_size, 248);
+        assert_eq!(&FRAME[8..10], &[0x00, 0x01], "sub-header magic");
+        // What `de.rs` puts in `BcMediaAdpcm::data`; its own test asserts 244.
+        let data = &FRAME[12..12 + payload_size - 4];
+        assert_eq!(data.len(), 244);
+        assert_eq!(u16::from_le_bytes([data[2], data[3]]), 16, "step index");
+
+        let pcm = adpcm_to_pcm(data).expect("decode");
+        assert_eq!(pcm.len(), (244 - 4) * 2 * 2);
+        assert!(peak(&pcm) > 0, "real capture decoded to pure silence");
+    }
+
+    #[test]
+    fn silence_decodes_to_a_bounded_signal() {
+        // Nibble 0 is the smallest positive step, so a run of 0x00 must stay
+        // near the predictor rather than diverge.
+        let pcm = adpcm_to_pcm(&block(64, 0x00)).expect("decode");
+        assert!(peak(&pcm) < 8000, "unexpectedly loud silence: {}", peak(&pcm));
+    }
+
+    #[test]
+    fn rejects_an_impossible_step_index() {
+        let mut raw = block(64, 0x11);
+        raw[2] = 0xFF;
+        raw[3] = 0x00; // 255, past the 88-entry IMA step table
+        assert!(adpcm_to_pcm(&raw).is_err());
+    }
+
+    #[test]
+    fn rejects_a_block_with_no_samples() {
+        assert!(adpcm_to_pcm(&[]).is_err());
+        assert!(adpcm_to_pcm(&[0x00, 0x00, 0x00, 0x00]).is_err());
+    }
 }

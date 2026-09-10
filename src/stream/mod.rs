@@ -60,21 +60,38 @@ use tokio::{
     time::{timeout, Duration, Instant},
 };
 
+// `neolink stream` needs no GStreamer for video — `mpegts.rs` is hand-rolled —
+// so a `--no-default-features` build keeps the subcommand and loses only the
+// ADPCM transcode. See `aac_nogst.rs`.
+#[cfg_attr(not(feature = "gstreamer"), path = "aac_nogst.rs")]
+mod aac;
+#[cfg(feature = "gstreamer")]
+mod adpcm;
 mod cmdline;
 mod mpegts;
 
 use crate::common::{now_epoch_ms, NeoInstance, NeoReactor};
 use crate::AnyResult;
-use cmdline::Format;
+use aac::{adts_duration_micros, AdpcmTranscoder};
+use cmdline::{AudioMode, Format};
 pub(crate) use cmdline::Opt;
 use mpegts::{AudioKind, TsMuxer};
 
 /// How long the codec-learning phase may buffer frames before giving up on
 /// ever seeing an audio track and emitting a video-only PMT.
+///
+/// Measured from the FIRST MEDIA UNIT, not from process start. Anchoring it at
+/// start was a latent bug: `NeoCam` init takes 4.4 s (login is 90 ms, the rest
+/// is camera-time and model/firmware queries at 2 s spacing), so the window had
+/// always expired before frame one and the PMT was decided on the first
+/// I-frame with the audio track still unknown. Nothing noticed while ADPCM was
+/// being dropped anyway; it is exactly what stopped the transcoder from ever
+/// being asked for (measured 2026-09-10: "Track layout learned: video H264,
+/// audio none" on a camera C that does send ADPCM).
 const LEARN_TIMEOUT: Duration = Duration::from_secs(3);
-/// Hard cap on frames buffered during the learning phase, so a camera that
-/// sends video but never audio cannot grow the buffer without bound.
-const LEARN_MAX_FRAMES: usize = 20;
+/// Hard cap on media units buffered during the learning phase, so a camera
+/// that sends video but never audio cannot grow the buffer without bound.
+const LEARN_MAX_FRAMES: usize = 30;
 /// Only treat a backwards jump in the camera's microsecond stamp as a counter
 /// wrap when the previous value was close to the top of the `u32`. Anything
 /// else is a camera-side reset (a reconnect), which must not add 2^32.
@@ -97,6 +114,27 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
         opt.camera, opt.format, opt.stale_timeout
     );
 
+    // Decided once, before any frame is written, because it decides the PMT:
+    // announcing an AAC track we then cannot produce leaves the consumer
+    // waiting on a stream that never arrives, which is worse than no audio.
+    let transcode = match (opt.format, opt.audio) {
+        (Format::H26x, _) => false,
+        (Format::Ts, AudioMode::None) => {
+            info!("{}::{stream}: audio disabled (--audio none)", opt.camera);
+            false
+        }
+        (Format::Ts, AudioMode::Aac) => match aac::probe() {
+            Ok(()) => true,
+            Err(e) => {
+                error!(
+                    "{}::{stream}: no AAC encoder, ADPCM audio will be dropped: {e:#}",
+                    opt.camera
+                );
+                false
+            }
+        },
+    };
+
     // The camera thread's own connection watchdog decides whether a BC session
     // is alive by reading this cell, on the understanding that whoever is
     // consuming frames writes to it. `neolink rtsp` writes it from the
@@ -109,7 +147,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
 
     let mut sink = Sink::new();
     let mut media_rx = subscribe(&camera, stream, strict);
-    let mut framer = Framer::new(opt.format);
+    let mut framer = Framer::new(opt.format, opt.audio, transcode, opt.audio_rate);
 
     pump(
         &opt.camera,
@@ -283,23 +321,52 @@ enum Framer {
     Raw { started: bool },
     /// MPEG-TS, buffering frames until the track layout is known.
     TsLearning {
-        deadline: Instant,
+        /// Set on the first media unit, not at construction. See
+        /// [`LEARN_TIMEOUT`].
+        deadline: Option<Instant>,
         video: Option<VideoType>,
         audio: Option<AudioKind>,
+        /// Whether the audio track, if any, comes from transcoding ADPCM.
+        transcoded: bool,
+        /// Set once the audio question is answered: an AAC or ADPCM frame has
+        /// arrived, or `--audio none` means the answer is fixed in advance.
+        /// This is what lets a camera stop buffering early.
+        audio_known: bool,
+        /// Whether an ADPCM track may be transcoded at all: `--audio aac` and
+        /// an encoder that actually exists in this process.
+        transcode_ok: bool,
+        /// `--audio-rate`, forwarded to the transcoder.
+        forced_rate: Option<u32>,
         pending: Vec<BcMedia>,
     },
     /// MPEG-TS, muxing.
-    TsRunning { mux: TsMuxer, clock: Clock },
+    TsRunning {
+        mux: TsMuxer,
+        clock: Clock,
+        /// `Some` only when the camera sends ADPCM and an encoder was built.
+        transcoder: Option<AdpcmTranscoder>,
+    },
 }
 
 impl Framer {
-    fn new(format: Format) -> Self {
+    fn new(
+        format: Format,
+        audio_mode: AudioMode,
+        transcode_ok: bool,
+        forced_rate: Option<u32>,
+    ) -> Self {
         match format {
             Format::H26x => Framer::Raw { started: false },
             Format::Ts => Framer::TsLearning {
-                deadline: Instant::now() + LEARN_TIMEOUT,
+                deadline: None,
                 video: None,
                 audio: None,
+                transcoded: false,
+                // `--audio none` answers the audio question before any frame
+                // arrives, so those cameras never pay the learning wait.
+                audio_known: audio_mode == AudioMode::None,
+                transcode_ok,
+                forced_rate,
                 pending: Vec::new(),
             },
         }
@@ -333,8 +400,13 @@ impl Framer {
                 deadline,
                 video,
                 audio,
+                transcoded,
+                audio_known,
+                transcode_ok,
+                forced_rate,
                 pending,
             } => {
+                let deadline = *deadline.get_or_insert_with(|| Instant::now() + LEARN_TIMEOUT);
                 let counted = match media {
                     BcMedia::Iframe(frame) => {
                         *video = Some(frame.video_type);
@@ -346,9 +418,25 @@ impl Framer {
                     }
                     BcMedia::Aac(_) => {
                         *audio = Some(AudioKind::Aac);
+                        *transcoded = false;
+                        *audio_known = true;
                         false
                     }
-                    BcMedia::Adpcm(_) => false,
+                    // ADPCM has no MPEG-TS stream type of its own, so it goes
+                    // into the PMT as AAC and through the encoder on the way
+                    // out. A camera that sent both would already have been
+                    // caught by the `Aac` arm above.
+                    BcMedia::Adpcm(_) => {
+                        if audio.is_none() && *transcode_ok {
+                            *audio = Some(AudioKind::Aac);
+                            *transcoded = true;
+                        }
+                        // Answered either way: with no encoder this camera's
+                        // audio is simply uncarryable, and waiting out the rest
+                        // of the window would not change that.
+                        *audio_known = true;
+                        false
+                    }
                     _ => false,
                 };
                 // Only start buffering at a key frame; anything before it is
@@ -358,36 +446,55 @@ impl Framer {
                     pending.push(media.clone());
                 }
 
-                let both_known = video.is_some() && audio.is_some();
-                let expired = Instant::now() >= *deadline || pending.len() >= LEARN_MAX_FRAMES;
+                let both_known = video.is_some() && *audio_known;
+                let expired = Instant::now() >= deadline || pending.len() >= LEARN_MAX_FRAMES;
                 if video.is_some() && (both_known || expired) {
                     let video = video.expect("checked just above");
                     let audio = *audio;
+                    // The one line that says what this process is doing with
+                    // audio: carried, transcoded, or absent.
                     info!(
-                        "Track layout learned: video {video:?}, audio {}",
-                        match audio {
-                            Some(kind) => format!("{kind:?}"),
-                            None => "none".to_string(),
+                        "Track layout learned after {} buffered units: video {video:?}, audio {}",
+                        pending.len(),
+                        match (audio, *transcoded) {
+                            (Some(AudioKind::Aac), true) => "adpcm -> aac (transcoded)",
+                            (Some(AudioKind::Aac), false) => "aac (camera, passthrough)",
+                            (None, _) => "none",
                         }
                     );
+                    let mut transcoder = transcoded.then(|| AdpcmTranscoder::new(*forced_rate));
                     let mut mux = TsMuxer::new(video, audio);
                     let mut clock = Clock::default();
                     let replay = std::mem::take(pending);
                     for frame in &replay {
-                        write_ts(&mut mux, &mut clock, frame, out);
+                        write_ts(&mut mux, &mut clock, &mut transcoder, frame, out);
                     }
-                    *self = Framer::TsRunning { mux, clock };
+                    *self = Framer::TsRunning {
+                        mux,
+                        clock,
+                        transcoder,
+                    };
                 }
                 counted
             }
-            Framer::TsRunning { mux, clock } => write_ts(mux, clock, media, out),
+            Framer::TsRunning {
+                mux,
+                clock,
+                transcoder,
+            } => write_ts(mux, clock, transcoder, media, out),
         }
     }
 }
 
 /// Mux one media unit into the transport stream. Returns whether it counted as
 /// a camera frame for staleness purposes.
-fn write_ts(mux: &mut TsMuxer, clock: &mut Clock, media: &BcMedia, out: &mut Vec<u8>) -> bool {
+fn write_ts(
+    mux: &mut TsMuxer,
+    clock: &mut Clock,
+    transcoder: &mut Option<AdpcmTranscoder>,
+    media: &BcMedia,
+    out: &mut Vec<u8>,
+) -> bool {
     match media {
         BcMedia::Iframe(frame) => {
             let pts = clock.video(frame.microseconds);
@@ -406,7 +513,27 @@ fn write_ts(mux: &mut TsMuxer, clock: &mut Clock, media: &BcMedia, out: &mut Vec
             }
             false
         }
-        // ADPCM has no MPEG-TS stream type, and InfoV1/V2 carry no media.
+        // ADPCM has no MPEG-TS stream type, so it is decoded to PCM and
+        // re-encoded as AAC, which does. The frames come out of the encoder in
+        // bursts (nothing at all until the sample rate has been measured, then
+        // ~1 s at once), which is exactly what the accumulate-and-re-anchor
+        // audio clock below already handles.
+        BcMedia::Adpcm(frame) => {
+            if let Some(transcoder) = transcoder.as_mut() {
+                let transcoded = transcoder.feed(&frame.data, clock.last_video_90k);
+                if let Some(anchor) = transcoded.anchor_90k {
+                    clock.anchor_audio(anchor);
+                }
+                if mux.has_audio() {
+                    for aac in &transcoded.frames {
+                        let pts = clock.audio(adts_duration_micros(aac));
+                        mux.write_audio(out, aac, pts);
+                    }
+                }
+            }
+            false
+        }
+        // InfoV1/V2 carry no media.
         _ => false,
     }
 }
@@ -456,6 +583,15 @@ impl Clock {
         let pts = micros_to_90k(absolute.saturating_sub(origin));
         self.last_video_90k = pts;
         pts
+    }
+
+    /// Pin the audio clock to a known video PTS.
+    ///
+    /// Used once, when the transcoder releases the audio it held while
+    /// measuring the camera's sample rate: those samples belong at the video
+    /// time they were captured, not at the video time the encoder started.
+    fn anchor_audio(&mut self, pts_90k: u64) {
+        self.audio_90k = Some(pts_90k);
     }
 
     /// Next audio PTS, advancing by `duration` microseconds if the ADTS header
@@ -535,7 +671,7 @@ mod tests {
             Duration::from_secs(30),
             &mut rx,
             &mut Sink::with_writer(writer),
-            &mut Framer::new(Format::H26x),
+            &mut Framer::new(Format::H26x, AudioMode::None, false, None),
             &AtomicU64::new(0),
         )
         .await;
@@ -567,7 +703,7 @@ mod tests {
             Duration::from_millis(300),
             &mut rx,
             &mut Sink::with_writer(writer),
-            &mut Framer::new(Format::H26x),
+            &mut Framer::new(Format::H26x, AudioMode::None, false, None),
             &AtomicU64::new(0),
         )
         .await;
@@ -604,7 +740,7 @@ mod tests {
             Duration::from_secs(30),
             &mut rx,
             &mut Sink::with_writer(writer),
-            &mut Framer::new(Format::H26x),
+            &mut Framer::new(Format::H26x, AudioMode::None, false, None),
             &AtomicU64::new(0),
         )
         .await
@@ -638,7 +774,7 @@ mod tests {
             Duration::from_secs(30),
             &mut rx,
             &mut Sink::with_writer(writer),
-            &mut Framer::new(Format::H26x),
+            &mut Framer::new(Format::H26x, AudioMode::None, false, None),
             &last_frame_at,
         )
         .await;
@@ -680,6 +816,103 @@ mod tests {
             assert!(pts >= previous, "{} went backwards from {}", pts, previous);
             previous = pts;
         }
+    }
+
+    fn adpcm() -> BcMedia {
+        // A DVI4 block as `de.rs` hands it over: 4 bytes of predictor state
+        // (zeroed) then nibble pairs. Built inline so this test compiles
+        // without the `gstreamer` feature, where `super::adpcm` is not.
+        let mut data = vec![0u8; 4];
+        data.resize(244, 0x35);
+        BcMedia::Adpcm(neolink_core::bcmedia::model::BcMediaAdpcm { data })
+    }
+
+    /// The learning window must start at the first frame, not at construction.
+    ///
+    /// `NeoCam` init takes 4.4 s, so a deadline anchored at `Framer::new` has
+    /// always expired by frame one and the PMT is written before any audio can
+    /// be seen. That is what shipped video-only PMTs to camera A and camera C.
+    #[test]
+    fn the_learning_window_starts_at_the_first_frame() {
+        let mut framer = Framer::new(Format::Ts, AudioMode::Aac, true, Some(16000));
+        // Stand in for the cold start: the camera delivers nothing for longer
+        // than the whole learning window.
+        std::thread::sleep(LEARN_TIMEOUT + Duration::from_millis(50));
+        let mut out = Vec::new();
+        framer.push(&iframe(0, 64), &mut out);
+        framer.push(&adpcm(), &mut out);
+        framer.push(&iframe(66_667, 64), &mut out);
+        match &framer {
+            Framer::TsRunning { mux, .. } => {
+                assert!(mux.has_audio(), "PMT came out video-only");
+            }
+            Framer::TsLearning { audio, .. } => {
+                assert_eq!(*audio, Some(AudioKind::Aac), "audio not learned");
+            }
+            Framer::Raw { .. } => panic!("wrong framer"),
+        }
+    }
+
+    /// `--audio none` must not pay the learning wait at all.
+    #[test]
+    fn audio_none_emits_the_pmt_on_the_first_key_frame() {
+        let mut framer = Framer::new(Format::Ts, AudioMode::None, false, None);
+        let mut out = Vec::new();
+        framer.push(&iframe(0, 64), &mut out);
+        match &framer {
+            Framer::TsRunning { mux, .. } => assert!(!mux.has_audio()),
+            _ => panic!("still learning after the first key frame"),
+        }
+    }
+
+    #[test]
+    fn audio_clock_is_monotonic_across_a_transcoded_run() {
+        let mut clock = Clock::default();
+        // 15 fps video and 64 ms AAC frames, which is 1024 samples at 16 kHz:
+        // the steady state of a transcoded camera C.
+        let mut previous = 0;
+        let mut last_video = 0;
+        for i in 0..300u64 {
+            last_video = clock.video((i * 66_667) as u32);
+            let pts = clock.audio(Some(64_000));
+            assert!(pts >= previous, "{} went backwards from {}", pts, previous);
+            previous = pts;
+        }
+        // 300 frames is ~20 s. Audio must still be sitting on video, i.e. the
+        // drift guard neither fired nor was needed.
+        let drift = previous as i64 - last_video as i64;
+        assert!(
+            drift.abs() < AUDIO_RESYNC_90K,
+            "audio drifted {} ticks from video over 300 frames",
+            drift
+        );
+    }
+
+    #[test]
+    fn anchoring_puts_held_audio_back_where_it_was_captured() {
+        let mut clock = Clock::default();
+        clock.video(0);
+        // One second of video passes while the transcoder measures the sample
+        // rate and holds the audio.
+        for i in 1..=15u64 {
+            clock.video((i * 66_667) as u32);
+        }
+        // The held audio belongs at the start of that second, not at "now".
+        clock.anchor_audio(0);
+        let first = clock.audio(Some(64_000));
+        assert_eq!(first, 0);
+        // Flushing ~1 s of it lands back alongside the current video PTS.
+        let mut pts = first;
+        for _ in 0..14 {
+            pts = clock.audio(Some(64_000));
+        }
+        let video = clock.last_video_90k;
+        assert!(
+            (pts as i64 - video as i64).abs() < micros_to_90k(200_000) as i64,
+            "flushed audio ended at {}, video is at {}",
+            pts,
+            video
+        );
     }
 
     #[test]
