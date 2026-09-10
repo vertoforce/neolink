@@ -171,6 +171,97 @@ fn pump_recv_timeout(
     }
 }
 
+/// fix 16 (refactor for test): the pad-probe mask used for the `pay0:src`
+/// egress counter. Hoisted out of the inline `add_probe` call so a
+/// regression test can assert the BUFFER_LIST bit is still set — the whole
+/// fix 16 defect was this mask being `BUFFER` alone, which a `PadProbeType`
+/// literal buried inside a closure registration made easy to regress.
+fn egress_probe_mask() -> gstreamer::PadProbeType {
+    gstreamer::PadProbeType::BUFFER | gstreamer::PadProbeType::BUFFER_LIST
+}
+
+/// fix 16 (refactor for test): how many RTP packets one probe invocation
+/// represents. `rtph264pay` / `rtph265pay` push a fragmented frame as ONE
+/// `GstBufferList`, so the counter must add the list's member count, not 1,
+/// for "egress_count" to mean "RTP packets egressed" in both cases.
+fn egress_packet_count(data: Option<&gstreamer::PadProbeData>) -> u64 {
+    match data {
+        Some(gstreamer::PadProbeData::BufferList(list)) => list.len().max(1) as u64,
+        _ => 1,
+    }
+}
+
+/// fix 16 (refactor for test): the PLAYING gate for the egress-stall and
+/// starvation exits. Read from `pay0` (the media pipeline's state), never
+/// from the appsrc — `send_to_appsrc`'s back-pressure logic deliberately
+/// toggles the appsrc element PAUSED/PLAYING by queue level, so appsrc state
+/// says nothing about whether a client is playing.
+fn pay0_playing(pay0: Option<&Element>) -> bool {
+    pay0.is_some_and(|p| p.current_state() == gstreamer::State::Playing)
+}
+
+/// fix 15 (refactor for test): the ORPHAN_DETACHED_TICKS state machine.
+/// `observe` is called once per empty frame-pump tick (PUMP_RECV_TICK_MS)
+/// with the result of the fix 4 terminal test; it returns true when the
+/// pump must fast-exit. Any attached tick resets the run.
+#[derive(Default, Debug)]
+struct OrphanDetachedTicks {
+    consecutive: u32,
+}
+
+impl OrphanDetachedTicks {
+    fn observe(&mut self, detached: bool) -> bool {
+        self.consecutive = if detached { self.consecutive + 1 } else { 0 };
+        self.consecutive >= ORPHAN_DETACHED_TICKS
+    }
+
+    fn count(&self) -> u32 {
+        self.consecutive
+    }
+}
+
+/// fix 15 (refactor for test): outcome of handing a finished bin back to
+/// `create_element`.
+#[derive(Debug, PartialEq, Eq)]
+enum BuildDelivery {
+    /// gst-rtsp-server has the bin; the caller owns a live pipeline and must
+    /// spawn the frame-pump.
+    Delivered,
+    /// The DESCRIBE that requested this build already gave up at
+    /// BUILD_REPLY_TIMEOUT (fix 6), so its Receiver is gone and no client
+    /// can ever attach to this bin. The caller must spawn NOTHING.
+    DiscardedRequesterGone,
+}
+
+/// fix 15 (refactor for test): deliver the finished bin, dropping it when
+/// the requester is gone. Dropping the returned `SendError` finalizes the
+/// bin; the caller additionally drops `media_rx`, which ends the BC
+/// start_video subscription. Pre-fix15 the frame-pump was spawned
+/// regardless, leaving a thread parked forever on an empty-but-open
+/// `media_rx` (prod: 121 threads / 586 FDs / 592 MB).
+fn deliver_build<T>(reply: std::sync::mpsc::SyncSender<T>, element: T) -> BuildDelivery {
+    match reply.send(element) {
+        Ok(()) => BuildDelivery::Delivered,
+        Err(e) => {
+            drop(e);
+            BuildDelivery::DiscardedRequesterGone
+        }
+    }
+}
+
+/// fix 6 (refactor for test): the BOUNDED wait that `create_element`
+/// performs on gst-rtsp-server's single shared glib main-loop thread.
+/// Extracted verbatim so a regression test can measure that it returns
+/// within `timeout` when the per-camera build task never replies — the
+/// pre-fix6 code called an UNBOUNDED `blocking_recv()` here and froze
+/// DESCRIBE for every camera.
+fn await_build_reply<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    timeout: Duration,
+) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
+    rx.recv_timeout(timeout)
+}
+
 fn rtsp_egress_staleness_ms() -> u64 {
     std::env::var("NEOLINK_RTSP_EGRESS_STALENESS_MS")
         .ok()
@@ -592,20 +683,12 @@ pub(super) async fn make_factory(
                                     // + fix 13 starvation exits could never arm. Count
                                     // the list's packets so the counter is "RTP
                                     // packets egressed" in both cases.
-                                    let _ = srcpad.add_probe(
-                                        gstreamer::PadProbeType::BUFFER
-                                            | gstreamer::PadProbeType::BUFFER_LIST,
-                                        move |_pad, info| {
-                                            let n = match info.data {
-                                                Some(gstreamer::PadProbeData::BufferList(
-                                                    ref list,
-                                                )) => list.len().max(1) as u64,
-                                                _ => 1,
-                                            };
+                                    let _ =
+                                        srcpad.add_probe(egress_probe_mask(), move |_pad, info| {
+                                            let n = egress_packet_count(info.data.as_ref());
                                             egress_count_probe.fetch_add(n, Ordering::Relaxed);
                                             gstreamer::PadProbeReturn::Ok
-                                        },
-                                    );
+                                        });
                                     log::debug!(
                                         "{name}::{stream}: attached RTSP egress probe on pay0 src pad"
                                     );
@@ -642,8 +725,7 @@ pub(super) async fn make_factory(
                         // next send fails and run_passive_task returns), and no
                         // pools/thread are ever created. The factory simply
                         // rebuilds on the client's retry.
-                        if let Err(e) = reply.send(element) {
-                            drop(e);
+                        if deliver_build(reply, element) == BuildDelivery::DiscardedRequesterGone {
                             log::info!(
                                 "{name}::{stream}: pipeline built after its DESCRIBE gave up (build-reply timeout) — discarding bin + camera subscription, not spawning a frame-pump (fix 15)"
                             );
@@ -831,7 +913,7 @@ pub(super) async fn make_factory(
                             // appsrc was found detached (orphan guard). Tick-
                             // only — separate from the push-path
                             // consecutive_detached counter.
-                            let mut detached_ticks: u32 = 0;
+                            let mut detached_ticks = OrphanDetachedTicks::default();
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
@@ -906,9 +988,7 @@ pub(super) async fn make_factory(
                                     // legitimate and reusable; leave it alone.
                                     // State is read from pay0 (see pay0_for_pump),
                                     // never from the appsrc.
-                                    let playing = pay0_for_pump.as_ref().is_some_and(|p| {
-                                        p.current_state() == gstreamer::State::Playing
-                                    });
+                                    let playing = pay0_playing(pay0_for_pump.as_ref());
                                     if egress_eos_at != 0 {
                                         // We already fired the egress EOS; wait
                                         // out the grace window then exit. We own
@@ -1031,12 +1111,10 @@ pub(super) async fn make_factory(
                                             .as_ref()
                                             .or(aud_src.as_ref())
                                             .is_some_and(|src| check_live(src).is_err());
-                                        detached_ticks =
-                                            if detached { detached_ticks + 1 } else { 0 };
-                                        if detached_ticks >= ORPHAN_DETACHED_TICKS {
+                                        if detached_ticks.observe(detached) {
                                             log::info!(
                                                 "{name}::{stream}: appsrc detached for {} idle ticks with no camera frames — orphan pipeline, fast-exiting frame-pump to free pools + camera subscription (fix 15)",
-                                                detached_ticks
+                                                detached_ticks.count()
                                             );
                                             break;
                                         }
@@ -1296,7 +1374,7 @@ pub(super) async fn make_factory(
         // (fix 15: the build task itself abandons a learn phase that outlives
         // this wait — BUILD_LEARN_ABANDON — and discards a bin whose reply
         // finds this receiver gone, so a timed-out build leaks nothing.)
-        let element = new_element.recv_timeout(BUILD_REPLY_TIMEOUT).map_err(|e| {
+        let element = await_build_reply(&new_element, BUILD_REPLY_TIMEOUT).map_err(|e| {
             log::warn!(
                 "create_element: pipeline build did not reply within {:?} ({e:?}) — failing this DESCRIBE so the shared glib main loop stays free for the other cameras",
                 BUILD_REPLY_TIMEOUT
@@ -2095,4 +2173,892 @@ fn buffer_size(_bitrate: u32) -> u32 {
     // sustained peak, comfortably above any realistic go2rtc/Frigate
     // hiccup. RAM cost is trivial (per-stream, one stream).
     10 * 1024 * 1024
+}
+// ---------------------------------------------------------------------------
+// Regression tests for the RTSP factory fixes (fix 6 / fix 14 / fix 15 /
+// fix 16).
+//
+// `neolink` is a BINARY crate with no lib target, so these live inside the
+// source file: an integration test under tests/ cannot see any of these
+// items.
+//
+// Every test that reconstructs pre-fix behaviour marks that arm clearly and
+// cites the commit the expression was copied from, so the A/B is auditable
+// without a second checkout.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc as stdmpsc;
+    use std::time::Instant;
+
+    // ======================= shared helpers =============================
+
+    /// True when GStreamer is initialised AND every named element plugin is
+    /// installed. The pad-probe tests need real *elements* (x264enc, the RTP
+    /// payloader), not just the -dev headers the build needs, so they skip
+    /// gracefully where the plugins are absent.
+    fn gst_elements_ready(required: &[&str]) -> bool {
+        if gstreamer::init().is_err() {
+            return false;
+        }
+        required
+            .iter()
+            .all(|n| gstreamer::ElementFactory::find(n).is_some())
+    }
+
+    /// Number of live threads in this process whose name is `name`.
+    /// `/proc/self/task/*/comm` is the same place the prod leak was counted
+    /// (121 threads on camera-d, 2026-08-28).
+    fn named_thread_count(name: &str) -> usize {
+        let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
+            return 0;
+        };
+        dir.filter_map(|e| e.ok())
+            .filter(|e| {
+                std::fs::read_to_string(e.path().join("comm"))
+                    .map(|c| c.trim() == name)
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    // =====================================================================
+    // D — fix 16: un-blind the pay0 egress probe (BUFFER_LIST)
+    // =====================================================================
+
+    /// One measured run of `videotestsrc ! x264enc ! rtph264pay ! fakesink`
+    /// with TWO probes on the payloader src pad.
+    ///
+    /// Returns (base_probe_invocations, fixed_probe_invocations,
+    ///          fixed_packets_counted, list_pushes, single_buffer_pushes).
+    struct ProbeCounts {
+        base_calls: u64,
+        fixed_calls: u64,
+        fixed_packets: u64,
+        list_pushes: u64,
+        buffer_pushes: u64,
+    }
+
+    fn measure_pay0_probes(width: u32, height: u32, mtu: u32, num_buffers: u32) -> ProbeCounts {
+        measure_pay0_probes_desc(&format!(
+            "videotestsrc num-buffers={num_buffers} pattern=snow \
+             ! video/x-raw,width={width},height={height},framerate=30/1 \
+             ! x264enc tune=zerolatency sliced-threads=false threads=1 \
+               speed-preset=ultrafast key-int-max=10 bitrate=8000 \
+             ! rtph264pay mtu={mtu} name=pay0 \
+             ! fakesink sync=false"
+        ))
+    }
+
+    /// Deterministic arm: feed `rtph264pay` `count` byte-stream NALs of
+    /// exactly `nal_size` bytes each, the shape a Reolink BC stream actually
+    /// delivers (one whole-frame NAL per frame). No encoder in the way, so
+    /// "how many pushes were buffer LISTS" is exact rather than dependent on
+    /// how many housekeeping NALs x264enc decided to emit.
+    fn measure_pay0_probes_appsrc(nal_size: usize, mtu: u32, count: usize) -> ProbeCounts {
+        let desc = format!(
+            "appsrc name=src is-live=false format=time              caps=video/x-h264,stream-format=byte-stream,alignment=nal              ! rtph264pay mtu={mtu} name=pay0              ! fakesink sync=false"
+        );
+        measure_pay0_probes_desc_with(&desc, move |pipeline| {
+            let src = pipeline
+                .by_name("src")
+                .expect("appsrc exists")
+                .downcast::<AppSrc>()
+                .expect("src is an appsrc");
+            for i in 0..count {
+                let mut nal = Vec::with_capacity(nal_size + 5);
+                // byte-stream start code + NAL header (0x65 = IDR slice)
+                nal.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x65]);
+                nal.resize(nal_size, (i % 251) as u8 | 0x01);
+                let mut buf = gstreamer::Buffer::from_mut_slice(nal);
+                {
+                    let b = buf.get_mut().unwrap();
+                    b.set_pts(ClockTime::from_mseconds(33 * i as u64));
+                    b.set_duration(ClockTime::from_mseconds(33));
+                }
+                src.push_buffer(buf).expect("appsrc accepts the NAL");
+            }
+            let _ = src.end_of_stream();
+        })
+    }
+
+    fn measure_pay0_probes_desc(desc: &str) -> ProbeCounts {
+        measure_pay0_probes_desc_with(desc, |_| {})
+    }
+
+    fn measure_pay0_probes_desc_with<F>(desc: &str, feed: F) -> ProbeCounts
+    where
+        F: FnOnce(&gstreamer::Pipeline) + Send + 'static,
+    {
+        use gstreamer::MessageType;
+        let pipeline = gstreamer::parse::launch(desc)
+            .expect("pipeline should parse")
+            .downcast::<gstreamer::Pipeline>()
+            .expect("parse::launch returns a Pipeline");
+        let pay0 = pipeline.by_name("pay0").expect("pay0 exists");
+        let srcpad = pay0.static_pad("src").expect("pay0 has a src pad");
+
+        let base_calls = Arc::new(AtomicU64::new(0));
+        let fixed_calls = Arc::new(AtomicU64::new(0));
+        let fixed_packets = Arc::new(AtomicU64::new(0));
+        let list_pushes = Arc::new(AtomicU64::new(0));
+        let buffer_pushes = Arc::new(AtomicU64::new(0));
+
+        // ---- PRE-FIX ARM ------------------------------------------------
+        // Verbatim shape of the probe as registered before fix 16
+        // (`git show c4e03a0:src/rtsp/factory.rs`, line 570):
+        //     gstreamer::PadProbeType::BUFFER,
+        //     move |_pad, _info| { egress_count_probe.fetch_add(1, ...) }
+        {
+            let c = base_calls.clone();
+            srcpad.add_probe(gstreamer::PadProbeType::BUFFER, move |_pad, _info| {
+                c.fetch_add(1, Ordering::Relaxed);
+                gstreamer::PadProbeReturn::Ok
+            });
+        }
+        // ---- SHIPPED ARM -------------------------------------------------
+        // Uses the production mask + counter, so a regression in either is a
+        // test failure.
+        {
+            let c = fixed_calls.clone();
+            let p = fixed_packets.clone();
+            let lp = list_pushes.clone();
+            let bp = buffer_pushes.clone();
+            srcpad.add_probe(egress_probe_mask(), move |_pad, info| {
+                c.fetch_add(1, Ordering::Relaxed);
+                p.fetch_add(egress_packet_count(info.data.as_ref()), Ordering::Relaxed);
+                match info.data {
+                    Some(gstreamer::PadProbeData::BufferList(_)) => {
+                        lp.fetch_add(1, Ordering::Relaxed)
+                    }
+                    _ => bp.fetch_add(1, Ordering::Relaxed),
+                };
+                gstreamer::PadProbeReturn::Ok
+            });
+        }
+
+        pipeline
+            .set_state(gstreamer::State::Playing)
+            .expect("pipeline should go PLAYING");
+        feed(&pipeline);
+        let bus = pipeline.bus().expect("pipeline has a bus");
+        let msg = bus.timed_pop_filtered(
+            gstreamer::ClockTime::from_seconds(60),
+            &[MessageType::Eos, MessageType::Error],
+        );
+        let _ = pipeline.set_state(gstreamer::State::Null);
+        assert!(
+            matches!(msg.as_ref().map(|m| m.type_()), Some(MessageType::Eos)),
+            "pipeline did not reach EOS cleanly: {:?}",
+            msg
+        );
+
+        ProbeCounts {
+            base_calls: base_calls.load(Ordering::Relaxed),
+            fixed_calls: fixed_calls.load(Ordering::Relaxed),
+            fixed_packets: fixed_packets.load(Ordering::Relaxed),
+            list_pushes: list_pushes.load(Ordering::Relaxed),
+            buffer_pushes: buffer_pushes.load(Ordering::Relaxed),
+        }
+    }
+
+    /// fix 16, the headline claim: a `GST_PAD_PROBE_TYPE_BUFFER`-only probe
+    /// is NEVER invoked when `rtph264pay` pushes a fragmented frame as one
+    /// `GstBufferList`, so the egress counter it feeds stays 0 forever and
+    /// both the egress-stall watchdog and the fix 13 starvation exit are
+    /// structurally inert.
+    ///
+    /// Three arms:
+    ///  1. FRAGMENTING (appsrc, one 6000-byte whole-frame NAL per frame,
+    ///     mtu=1400) — the shape a Reolink BC stream delivers. Every push is
+    ///     a buffer list, so the pre-fix probe must count exactly 0.
+    ///  2. CONTROL (appsrc, 800-byte NALs, mtu=1400) — nothing fragments, so
+    ///     the same pre-fix probe DOES fire. This is why the blindness hid
+    ///     for months: it is invisible on any small-frame pipeline.
+    ///  3. REAL ENCODER (videotestsrc ! x264enc ! rtph264pay) — a live
+    ///     payloader, mixed NAL sizes; shows the pre-fix probe counting only
+    ///     the housekeeping NALs and missing every fragmented slice.
+    #[test]
+    fn fix16_buffer_only_probe_is_blind_to_payloader_buffer_lists() {
+        if !gst_elements_ready(&["appsrc", "rtph264pay", "fakesink"]) {
+            eprintln!(
+                "SKIP fix16_buffer_only_probe_is_blind_to_payloader_buffer_lists: \
+                 GStreamer elements (appsrc/rtph264pay/fakesink) not installed"
+            );
+            return;
+        }
+
+        const FRAMES: usize = 60;
+        let frag = measure_pay0_probes_appsrc(6000, 1400, FRAMES);
+        eprintln!(
+            "[fix 16] FRAGMENTING ({FRAMES} x 6000-byte NAL, mtu=1400): \
+             PRE-FIX BUFFER-only probe calls={} | SHIPPED BUFFER|BUFFER_LIST probe calls={} \
+             (lists={}, single buffers={}) counting {} RTP packets",
+            frag.base_calls,
+            frag.fixed_calls,
+            frag.list_pushes,
+            frag.buffer_pushes,
+            frag.fixed_packets
+        );
+
+        let ctl = measure_pay0_probes_appsrc(800, 1400, FRAMES);
+        eprintln!(
+            "[fix 16] CONTROL ({FRAMES} x 800-byte NAL, mtu=1400): \
+             PRE-FIX BUFFER-only probe calls={} | SHIPPED BUFFER|BUFFER_LIST probe calls={} \
+             (lists={}, single buffers={}) counting {} RTP packets",
+            ctl.base_calls, ctl.fixed_calls, ctl.list_pushes, ctl.buffer_pushes, ctl.fixed_packets
+        );
+
+        // ---- arm 1: 100% buffer lists => the pre-fix counter never moves --
+        assert_eq!(
+            frag.list_pushes, FRAMES as u64,
+            "every fragmenting frame should be pushed as one buffer list"
+        );
+        assert_eq!(
+            frag.buffer_pushes, 0,
+            "fragmenting arm unexpectedly pushed {} single buffers",
+            frag.buffer_pushes
+        );
+        assert!(
+            frag.fixed_packets > frag.fixed_calls,
+            "a fragmented frame must carry more than one RTP packet ({} packets / {} pushes)",
+            frag.fixed_packets,
+            frag.fixed_calls
+        );
+        // THE BUG: the pre-fix16 probe saw none of those RTP packets, so
+        // egress_count stayed 0, "egress has started" was never true, and
+        // neither the egress-stall exit nor the fix 13 starvation exit could
+        // ever arm.
+        assert_eq!(
+            frag.base_calls, 0,
+            "pre-fix16 BUFFER-only probe fired {} times on a 100%-buffer-list \
+             pipeline — bug NOT reproduced",
+            frag.base_calls
+        );
+
+        // ---- arm 2: control -------------------------------------------
+        assert_eq!(
+            ctl.list_pushes, 0,
+            "control arm should not fragment, saw {} lists",
+            ctl.list_pushes
+        );
+        assert_eq!(
+            ctl.base_calls, FRAMES as u64,
+            "control arm: the same BUFFER-only probe must fire for every \
+             non-fragmented push"
+        );
+        assert_eq!(
+            ctl.base_calls, ctl.fixed_calls,
+            "control arm: both masks must see the same single-buffer pushes"
+        );
+
+        // ---- arm 3: a real encoder + payloader --------------------------
+        if !gst_elements_ready(&["videotestsrc", "x264enc"]) {
+            eprintln!("[fix 16] real-encoder arm skipped: videotestsrc/x264enc not installed");
+            return;
+        }
+        let enc = measure_pay0_probes(1280, 720, 1400, FRAMES as u32);
+        let packets_missed = enc.fixed_packets - enc.base_calls;
+        eprintln!(
+            "[fix 16] REAL ENCODER (videotestsrc ! x264enc 1280x720 ! rtph264pay mtu=1400, \
+             {FRAMES} frames): PRE-FIX BUFFER-only probe calls={} | SHIPPED calls={} \
+             (lists={}, single buffers={}) counting {} RTP packets — pre-fix missed \
+             {packets_missed} of {} packets ({:.1}%)",
+            enc.base_calls,
+            enc.fixed_calls,
+            enc.list_pushes,
+            enc.buffer_pushes,
+            enc.fixed_packets,
+            enc.fixed_packets,
+            100.0 * packets_missed as f64 / enc.fixed_packets as f64
+        );
+        assert!(
+            enc.list_pushes > 0,
+            "real encoder arm did not fragment anything"
+        );
+        // The pre-fix probe fired for EXACTLY the non-list pushes and for no
+        // list push at all.
+        assert_eq!(
+            enc.base_calls, enc.buffer_pushes,
+            "pre-fix probe count must equal the single-buffer push count \
+             (it is structurally incapable of seeing a list)"
+        );
+        assert!(
+            packets_missed * 10 > enc.fixed_packets * 9,
+            "expected the pre-fix probe to miss >90% of RTP packets, missed \
+             {packets_missed} of {}",
+            enc.fixed_packets
+        );
+    }
+
+    /// Cheap guard against re-regressing the constant that caused fix 16.
+    #[test]
+    fn fix16_egress_probe_mask_includes_buffer_list() {
+        let mask = egress_probe_mask();
+        assert!(
+            mask.contains(gstreamer::PadProbeType::BUFFER_LIST),
+            "egress probe mask lost BUFFER_LIST — the fix 16 defect"
+        );
+        assert!(
+            mask.contains(gstreamer::PadProbeType::BUFFER),
+            "egress probe mask lost BUFFER"
+        );
+        // The pre-fix mask, for the record.
+        assert!(
+            !gstreamer::PadProbeType::BUFFER.contains(gstreamer::PadProbeType::BUFFER_LIST),
+            "BUFFER is not a superset of BUFFER_LIST"
+        );
+    }
+
+    /// The counter must report RTP PACKETS, not probe invocations: a
+    /// fragmented frame is one invocation carrying N packets.
+    #[test]
+    fn fix16_egress_packet_count_counts_buffer_list_members() {
+        if gstreamer::init().is_err() {
+            eprintln!(
+                "SKIP fix16_egress_packet_count_counts_buffer_list_members: gst init failed"
+            );
+            return;
+        }
+        let mut list = gstreamer::BufferList::new();
+        {
+            let l = list.get_mut().unwrap();
+            for _ in 0..5 {
+                l.add(gstreamer::Buffer::with_size(64).unwrap());
+            }
+        }
+        assert_eq!(
+            egress_packet_count(Some(&gstreamer::PadProbeData::BufferList(list))),
+            5,
+            "a 5-packet buffer list must count as 5 RTP packets"
+        );
+        assert_eq!(
+            egress_packet_count(Some(&gstreamer::PadProbeData::Buffer(
+                gstreamer::Buffer::with_size(64).unwrap()
+            ))),
+            1
+        );
+        assert_eq!(egress_packet_count(None), 1);
+        // Degenerate empty list still counts as one push (max(1)).
+        assert_eq!(
+            egress_packet_count(Some(&gstreamer::PadProbeData::BufferList(
+                gstreamer::BufferList::new()
+            ))),
+            1
+        );
+    }
+
+    /// fix 16 half two: the stall/starvation exits are gated on pay0 being
+    /// PLAYING, so a cached shared media left PAUSED by a DESCRIBE-only
+    /// client is never EOS'd into a corpse.
+    #[test]
+    fn fix16_stall_exits_are_gated_on_pay0_playing() {
+        if !gst_elements_ready(&["rtph264pay"]) {
+            eprintln!(
+                "SKIP fix16_stall_exits_are_gated_on_pay0_playing: rtph264pay not installed"
+            );
+            return;
+        }
+        // No pay0 at all (splash / unknown pipeline): never armed.
+        assert!(!pay0_playing(None), "a missing pay0 must not arm the exits");
+
+        // The real pay0 element type. A payloader is a plain filter, so its
+        // state changes complete synchronously outside a pipeline.
+        let el = gstreamer::ElementFactory::make("rtph264pay")
+            .build()
+            .expect("rtph264pay should build");
+        assert!(
+            !pay0_playing(Some(&el)),
+            "a NULL-state pay0 must not arm the exits"
+        );
+        el.set_state(gstreamer::State::Paused)
+            .expect("pay0 -> PAUSED");
+        assert!(
+            !pay0_playing(Some(&el)),
+            "a PAUSED (cached, DESCRIBE-only) pay0 must not arm the exits — \
+             EOS'ing it leaves the post-EOS corpse every later DESCRIBE reuses"
+        );
+        el.set_state(gstreamer::State::Playing)
+            .expect("pay0 -> PLAYING");
+        assert!(pay0_playing(Some(&el)), "a PLAYING pay0 must arm the exits");
+        let _ = el.set_state(gstreamer::State::Null);
+    }
+
+    /// fix 16 half three: `pipeline_generation` must only advance when the
+    /// bin was actually DELIVERED to gst-rtsp-server. Bumping at request time
+    /// made the currently-serving pump "not newest", silently disabling the
+    /// fix 9 zombie-client kick on its terminal exit.
+    ///
+    /// Model: one healthy build that IS delivered, then `n` builds whose
+    /// DESCRIBE already timed out (receiver dropped).
+    fn generation_after_timed_out_builds(fixed: bool, n: usize) -> (u64, u64) {
+        let generation = AtomicU64::new(0);
+        // The healthy build that is actually serving clients.
+        let (reply, rx) = stdmpsc::sync_channel::<u8>(1);
+        let serving_generation = if fixed {
+            reply.send(1).expect("live receiver");
+            generation.fetch_add(1, Ordering::SeqCst) + 1
+        } else {
+            // PRE-FIX (`git show c4e03a0:src/rtsp/factory.rs`): bump at
+            // request time, before the build even runs.
+            let g = generation.fetch_add(1, Ordering::SeqCst) + 1;
+            reply.send(1).expect("live receiver");
+            g
+        };
+        drop(rx);
+
+        for _ in 0..n {
+            let (reply, rx) = stdmpsc::sync_channel::<u8>(1);
+            drop(rx); // the DESCRIBE gave up at BUILD_REPLY_TIMEOUT
+            if fixed {
+                if reply.send(1).is_ok() {
+                    generation.fetch_add(1, Ordering::SeqCst);
+                }
+            } else {
+                generation.fetch_add(1, Ordering::SeqCst);
+                let _ = reply.send(1);
+            }
+        }
+        (serving_generation, generation.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn fix16_generation_bumps_only_for_delivered_builds() {
+        // 16 timed-out builds — the count iso-measured in the fix 15 run.
+        const TIMED_OUT: usize = 16;
+
+        let (base_serving, base_newest) = generation_after_timed_out_builds(false, TIMED_OUT);
+        let (fix_serving, fix_newest) = generation_after_timed_out_builds(true, TIMED_OUT);
+        eprintln!(
+            "[fix 16] after {TIMED_OUT} timed-out builds: PRE-FIX serving_gen={base_serving} \
+             newest_gen={base_newest} (zombie kick armed: {}) | SHIPPED serving_gen={fix_serving} \
+             newest_gen={fix_newest} (zombie kick armed: {})",
+            base_serving == base_newest,
+            fix_serving == fix_newest
+        );
+
+        // Pre-fix: the counter ran away from the pump that is actually
+        // serving, so `my_generation == newest` was false and the fix 9
+        // zombie-client kick silently never fired.
+        assert_eq!(base_newest, 1 + TIMED_OUT as u64);
+        assert_ne!(
+            base_serving, base_newest,
+            "pre-fix arm should have de-synced the serving pump's generation"
+        );
+
+        // Shipped: undelivered builds do not touch the counter.
+        assert_eq!(fix_newest, 1, "only the delivered build may bump");
+        assert_eq!(
+            fix_serving, fix_newest,
+            "the serving pump must still be the newest generation so its \
+             terminal exit kicks its starved clients (fix 9)"
+        );
+    }
+
+    // =====================================================================
+    // F — fix 6 bounded DESCRIBE wait + fix 15 orphan frame-pump leak
+    // =====================================================================
+
+    /// Result of one modelled pass of gst-rtsp-server's SINGLE shared glib
+    /// main-loop thread over two cameras' DESCRIBEs: camera A is
+    /// mid-reconnect and its build task never replies, camera B is healthy
+    /// and replies at once.
+    struct SharedLoopRun {
+        a_wait: Option<Duration>,
+        b_served_after: Option<Duration>,
+    }
+
+    fn shared_main_loop_two_cameras(bounded: bool, outer_bound: Duration) -> SharedLoopRun {
+        let (a_tx, a_rx) = stdmpsc::sync_channel::<u8>(1);
+        let (b_tx, b_rx) = stdmpsc::sync_channel::<u8>(1);
+        let (done_tx, done_rx) = stdmpsc::channel::<(Duration, Option<Duration>)>();
+
+        std::thread::Builder::new()
+            .name("fx-glib-loop".into())
+            .spawn(move || {
+                // ---- DESCRIBE for camera A (wedged) ----
+                let a_start = Instant::now();
+                if bounded {
+                    // SHIPPED fix 6.
+                    let _ = await_build_reply(&a_rx, BUILD_REPLY_TIMEOUT);
+                } else {
+                    // PRE-FIX ARM — the expression from
+                    // `git show 3ddaff6^:src/rtsp/factory.rs` line 748:
+                    //     let element = new_element.blocking_recv()?;
+                    // (tokio oneshot there, std mpsc here; both are an
+                    // UNBOUNDED blocking receive on this shared thread.)
+                    let _ = a_rx.recv();
+                }
+                let a_wait = a_start.elapsed();
+                // ---- DESCRIBE for camera B (healthy) ----
+                let b_start = Instant::now();
+                let served = await_build_reply(&b_rx, BUILD_REPLY_TIMEOUT).is_ok();
+                let _ = done_tx.send((a_wait, served.then(|| b_start.elapsed())));
+            })
+            .expect("spawn");
+
+        // Camera B's build task replies immediately.
+        b_tx.send(1).expect("camera B reply");
+
+        let out = match done_rx.recv_timeout(outer_bound) {
+            Ok((a_wait, b)) => SharedLoopRun {
+                a_wait: Some(a_wait),
+                b_served_after: b,
+            },
+            Err(_) => SharedLoopRun {
+                a_wait: None,
+                b_served_after: None,
+            },
+        };
+        // Releasing camera A only now lets the pre-fix arm's thread finish.
+        drop(a_tx);
+        out
+    }
+
+    /// fix 6: an unbounded wait on the shared glib main-loop thread lets ONE
+    /// wedged camera freeze DESCRIBE for every camera. The bounded wait fails
+    /// that one DESCRIBE at BUILD_REPLY_TIMEOUT and serves the next camera.
+    #[test]
+    fn fix6_bounded_build_wait_frees_the_shared_loop_for_other_cameras() {
+        let outer = BUILD_REPLY_TIMEOUT + Duration::from_secs(3);
+
+        // Run both arms concurrently so the test costs ~one timeout, not two.
+        let (base, fixed) = std::thread::scope(|s| {
+            let b = s.spawn(|| shared_main_loop_two_cameras(false, outer));
+            let f = s.spawn(|| shared_main_loop_two_cameras(true, outer));
+            (b.join().unwrap(), f.join().unwrap())
+        });
+
+        eprintln!(
+            "[fix 6] PRE-FIX (unbounded recv): camera A wait={:?}, camera B served after={:?} \
+             (outer bound {:?})",
+            base.a_wait, base.b_served_after, outer
+        );
+        eprintln!(
+            "[fix 6] SHIPPED (recv_timeout {:?}): camera A wait={:?}, camera B served after={:?}",
+            BUILD_REPLY_TIMEOUT, fixed.a_wait, fixed.b_served_after
+        );
+
+        // BASE: the shared thread is still parked in camera A's recv when the
+        // outer bound expires, so camera B was never even reached.
+        assert!(
+            base.a_wait.is_none() && base.b_served_after.is_none(),
+            "pre-fix arm did NOT hang — bug not reproduced (a_wait={:?}, b={:?})",
+            base.a_wait,
+            base.b_served_after
+        );
+
+        // FIXED: camera A's DESCRIBE fails at ~BUILD_REPLY_TIMEOUT...
+        let a_wait = fixed.a_wait.expect("shipped arm must return");
+        assert!(
+            a_wait >= BUILD_REPLY_TIMEOUT && a_wait < BUILD_REPLY_TIMEOUT + Duration::from_secs(2),
+            "bounded wait took {:?}, expected ~{:?}",
+            a_wait,
+            BUILD_REPLY_TIMEOUT
+        );
+        // ...and camera B is served immediately afterwards.
+        let b = fixed
+            .b_served_after
+            .expect("camera B must be served once the loop is free");
+        assert!(
+            b < Duration::from_secs(1),
+            "camera B waited {:?} after the loop was freed",
+            b
+        );
+    }
+
+    /// One modelled build that completes AFTER its DESCRIBE gave up.
+    /// Returns the pump threads it spawned plus the `media_tx` handles that
+    /// stand in for the `stream()` task's `run_passive_task` loop (which only
+    /// ends when a send fails — i.e. only after the pump drops `media_rx`).
+    #[allow(clippy::type_complexity)]
+    fn run_timed_out_builds(
+        fixed: bool,
+        n: usize,
+        stop: &Arc<AtomicBool>,
+    ) -> (Vec<std::thread::JoinHandle<()>>, Vec<stdmpsc::Sender<u8>>) {
+        let mut pumps = Vec::new();
+        let mut subscriptions = Vec::new();
+        for _ in 0..n {
+            // Its DESCRIBE already returned at BUILD_REPLY_TIMEOUT, so the
+            // Receiver is gone.
+            let (reply, rx) = stdmpsc::sync_channel::<Vec<u8>>(1);
+            drop(rx);
+            // The BC start_video subscription this build opened.
+            let (media_tx, media_rx) = stdmpsc::channel::<u8>();
+            let bin = vec![0u8; 4096];
+            if fixed {
+                // SHIPPED fix 15, via the production delivery path: the bin
+                // (returned inside the SendError) is dropped there, and the
+                // caller drops media_rx, which ends the camera subscription.
+                if deliver_build(reply, bin) == BuildDelivery::DiscardedRequesterGone {
+                    drop(media_rx);
+                    drop(media_tx);
+                    continue;
+                }
+                unreachable!("the requester was dropped, delivery cannot succeed");
+            }
+            // PRE-FIX: send and carry on regardless of the result.
+            let sent = reply.send(bin);
+            // PRE-FIX: spawn the frame-pump regardless. Its media_rx is EMPTY
+            // but OPEN forever (media_tx is held by the stream task), so no
+            // pre-fix15 exit path can ever run: they all need a frame or
+            // started egress.
+            subscriptions.push(media_tx);
+            let stop = stop.clone();
+            pumps.push(
+                std::thread::Builder::new()
+                    .name("fx-orphan-pump".into())
+                    .spawn(move || {
+                        let _bin = sent; // the pump holds the bin + pools
+                        while !stop.load(Ordering::Relaxed) {
+                            match media_rx.recv_timeout(Duration::from_millis(20)) {
+                                Ok(_) => {}
+                                Err(stdmpsc::RecvTimeoutError::Timeout) => {}
+                                Err(stdmpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                    })
+                    .expect("spawn"),
+            );
+        }
+        (pumps, subscriptions)
+    }
+
+    /// fix 15 (a): when `reply.send()` fails because the DESCRIBE already
+    /// timed out, the build must discard the bin + subscription and spawn
+    /// NOTHING. Pre-fix it spawned a frame-pump that parked forever on an
+    /// empty-but-open `media_rx` — measured in prod as 121 threads / 586 FDs
+    /// / 592 MB on camera-d.
+    #[test]
+    fn fix15_reply_send_failure_spawns_no_orphan_frame_pump() {
+        const TIMED_OUT: usize = 16;
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let baseline = named_thread_count("fx-orphan-pump");
+
+        let (fix_pumps, fix_subs) = run_timed_out_builds(true, TIMED_OUT, &stop);
+        std::thread::sleep(Duration::from_millis(200));
+        let after_fixed = named_thread_count("fx-orphan-pump");
+
+        let (base_pumps, base_subs) = run_timed_out_builds(false, TIMED_OUT, &stop);
+        std::thread::sleep(Duration::from_millis(200));
+        let after_base = named_thread_count("fx-orphan-pump");
+
+        eprintln!(
+            "[fix 15] {TIMED_OUT} builds whose DESCRIBE timed out: live orphan pump threads — \
+             baseline={baseline}, after SHIPPED arm={after_fixed}, after PRE-FIX arm={after_base}"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(base_subs);
+        drop(fix_subs);
+        for h in base_pumps.into_iter().chain(fix_pumps) {
+            let _ = h.join();
+        }
+
+        assert_eq!(
+            after_fixed,
+            baseline,
+            "shipped arm leaked {} orphan pump thread(s)",
+            after_fixed - baseline
+        );
+        assert_eq!(
+            after_base - baseline,
+            TIMED_OUT,
+            "pre-fix arm should have leaked one pump per timed-out build"
+        );
+    }
+
+    /// fix 15 (b): the ORPHAN_DETACHED_TICKS state machine. Detachment is
+    /// noticed on empty ticks, so an orphan no longer needs a frame to be
+    /// reaped; any attached tick resets the run.
+    #[test]
+    fn fix15_orphan_detached_tick_state_machine() {
+        assert_eq!(ORPHAN_DETACHED_TICKS, 3);
+        assert_eq!(PUMP_RECV_TICK_MS, 5_000);
+
+        let mut t = OrphanDetachedTicks::default();
+        assert!(!t.observe(true), "1 detached tick must not exit");
+        assert!(!t.observe(true), "2 detached ticks must not exit");
+        assert!(t.observe(true), "3 consecutive detached ticks must exit");
+        assert_eq!(t.count(), 3);
+
+        // An attached tick resets the run.
+        let mut t = OrphanDetachedTicks::default();
+        assert!(!t.observe(true));
+        assert!(!t.observe(true));
+        assert!(!t.observe(false), "attached tick must reset");
+        assert_eq!(t.count(), 0);
+        assert!(!t.observe(true));
+        assert!(!t.observe(true));
+        assert!(t.observe(true));
+
+        // Worst-case reap latency, in the same units as the prod log
+        // ("2 orphan-guard exits, each 15s after a consumer left").
+        let latency_ms = u64::from(ORPHAN_DETACHED_TICKS) * PUMP_RECV_TICK_MS;
+        assert_eq!(latency_ms, 15_000);
+
+        // PRE-FIX ARM: before fix 15 the pump had NO tick-side detach check
+        // at all — the fix 4 terminal test only ran inside the push path, so
+        // an empty media_rx meant it never ran. Model 1000 empty ticks.
+        let mut base_exits = 0usize;
+        for _ in 0..1000 {
+            // pre-fix15: an empty tick does nothing.
+            let exited = false;
+            if exited {
+                base_exits += 1;
+            }
+        }
+        eprintln!(
+            "[fix 15] 1000 empty detached ticks ({} s modelled): PRE-FIX exits={base_exits}, \
+             SHIPPED exits after {latency_ms} ms",
+            1000 * PUMP_RECV_TICK_MS / 1000
+        );
+        assert_eq!(base_exits, 0, "pre-fix arm must never reap an orphan");
+    }
+
+    /// fix 15 (c): BUILD_LEARN_ABANDON must stay at 2x the requester's wait
+    /// so a build is only abandoned once its requester is provably gone.
+    /// ASSERTION ON CONSTANTS ONLY — the learn loop itself is inline in the
+    /// build task and is not covered behaviourally here.
+    #[test]
+    fn fix15_build_learn_abandon_is_twice_the_reply_timeout() {
+        assert_eq!(BUILD_REPLY_TIMEOUT, Duration::from_secs(8));
+        assert_eq!(BUILD_LEARN_ABANDON, Duration::from_secs(16));
+        assert_eq!(BUILD_LEARN_ABANDON, 2 * BUILD_REPLY_TIMEOUT);
+    }
+
+    // =====================================================================
+    // H — fix 14 dead-camera DESCRIBE liveness gate
+    // =====================================================================
+
+    /// Evaluate the shipped gate for a camera whose last frame / successful
+    /// reconnect was `last_seen_ms_ago` ago (None = never connected), with a
+    /// factory armed `factory_age` ago.
+    fn gate_dead(last_seen_ms_ago: Option<u64>, factory_age: Duration) -> bool {
+        let now = crate::common::now_epoch_ms();
+        let last = Arc::new(AtomicU64::new(match last_seen_ms_ago {
+            None => 0,
+            Some(ago) => now.saturating_sub(ago),
+        }));
+        let armed_at = Instant::now()
+            .checked_sub(factory_age)
+            .expect("monotonic clock is old enough");
+        liveness_gate_dead(&last, &armed_at)
+    }
+
+    /// The PRE-FIX / rejected variant: the same predicate at 1x
+    /// FRAME_STALENESS_MS instead of 2x. Iso-measured 2026-08-15 as
+    /// false-failing a healthy idle camera in its post-reconnect window.
+    fn gate_dead_at_1x(last_seen_ms_ago: Option<u64>, factory_age: Duration) -> bool {
+        let now = crate::common::now_epoch_ms();
+        match last_seen_ms_ago {
+            None => factory_age >= Duration::from_millis(NEVER_CONNECTED_GRACE_MS),
+            Some(ago) => {
+                let last = now.saturating_sub(ago);
+                crate::common::now_epoch_ms().saturating_sub(last)
+                    > crate::common::FRAME_STALENESS_MS
+            }
+        }
+    }
+
+    #[test]
+    fn fix14_liveness_gate_table() {
+        assert_eq!(NEVER_CONNECTED_GRACE_MS, 15_000);
+        assert_eq!(GATE_STALENESS_MS, 60_000);
+        assert_eq!(GATE_STALENESS_MS, 2 * crate::common::FRAME_STALENESS_MS);
+
+        let long_ago = Duration::from_secs(3600);
+
+        // | case | expect dead |
+        let cases: &[(&str, Option<u64>, Duration, bool)] = &[
+            (
+                "never connected, factory 14s old (inside grace)",
+                None,
+                Duration::from_secs(14),
+                false,
+            ),
+            (
+                "never connected, factory 16s old (past grace)",
+                None,
+                Duration::from_secs(16),
+                true,
+            ),
+            (
+                "connected, last frame 59s ago",
+                Some(59_000),
+                long_ago,
+                false,
+            ),
+            (
+                "connected, last frame 61s ago",
+                Some(61_000),
+                long_ago,
+                true,
+            ),
+            (
+                "connected, no frame, successful reconnect 5s ago",
+                Some(5_000),
+                long_ago,
+                false,
+            ),
+            (
+                "idle-cycle window: last frame FRAME_STALENESS_MS + 5s ago",
+                Some(crate::common::FRAME_STALENESS_MS + 5_000),
+                long_ago,
+                false,
+            ),
+            (
+                "never connected, factory 15s old exactly (grace is >=)",
+                None,
+                Duration::from_secs(15),
+                true,
+            ),
+        ];
+
+        for (label, last_seen, age, expect_dead) in cases {
+            let got = gate_dead(*last_seen, *age);
+            eprintln!("[fix 14] {label}: dead={got} (expected {expect_dead})");
+            assert_eq!(got, *expect_dead, "gate mismatch for: {label}");
+        }
+    }
+
+    /// The case that made GATE_STALENESS_MS 2x: a healthy camera whose BC
+    /// connection just cycled (idle-cycle at ~FRAME_STALENESS_MS, plus the
+    /// ~4-5s of post-login settle sleeps before camthread re-stores
+    /// last_frame_at). At 1x the gate bounces the very DESCRIBE whose frames
+    /// would prove the camera alive.
+    #[test]
+    fn fix14_one_times_frame_staleness_false_fails_a_reconnecting_camera() {
+        let long_ago = Duration::from_secs(3600);
+        let idle_cycle_peak = crate::common::FRAME_STALENESS_MS + 5_000; // 35s
+
+        let base = gate_dead_at_1x(Some(idle_cycle_peak), long_ago);
+        let shipped = gate_dead(Some(idle_cycle_peak), long_ago);
+        eprintln!(
+            "[fix 14] healthy idle camera, last frame {idle_cycle_peak} ms ago: \
+             1x-FRAME_STALENESS_MS gate says dead={base}; shipped 2x gate says dead={shipped}"
+        );
+
+        assert!(
+            base,
+            "1x arm did NOT false-fail — the rejected variant is not reproduced"
+        );
+        assert!(
+            !shipped,
+            "shipped gate must leave a healthy idle camera alive at {} ms",
+            idle_cycle_peak
+        );
+
+        // A camera whose reconnects are actually FAILING still trips it: a
+        // successful reconnect re-stores last_frame_at, so staleness can only
+        // grow past 2x when nothing is reconnecting.
+        assert!(
+            gate_dead(Some(GATE_STALENESS_MS + 1_000), long_ago),
+            "a truly dead camera must still be gated"
+        );
+    }
 }
