@@ -122,7 +122,14 @@ impl BcConnection {
     }
 
     pub async fn subscribe(&self, msg_id: u32, msg_num: u16) -> Result<BcSubscription> {
-        let (tx, rx) = channel(500);
+        // 500 (upstream PR #399) -> 1000. PR #399 raised this from 100 to 500;
+        // on our 4K/5MP HEVC cameras 500 was still short. Chronic ~10/s
+        // "Subscriber channel full" drops on camera_d video
+        // (MSG_ID_VIDEO=3) showed brief consumer pauses (GST appsrc / RTSP
+        // server hiccups) outrun it: 500 slots is ~1.1 s of buffering at
+        // 5 Mbps HEVC 20 fps, 1000 is ~2.2 s. RAM cost ~1.4 KB per slot
+        // (~1.4 MB per subscriber) is trivial. Net-new tuning on top of #399.
+        let (tx, rx) = channel(1000);
         self.poll_commander
             .send(PollCommand::AddSubscriber(msg_id, Some(msg_num), tx))
             .await?;
@@ -159,7 +166,8 @@ impl BcConnection {
     ///
     /// This function creates a temporary handle to grab this single message
     pub async fn subscribe_to_id(&self, msg_id: u32) -> Result<BcSubscription> {
-        let (tx, rx) = channel(500);
+        // Same bump as subscribe() above - 500 -> 1000 to absorb consumer pauses.
+        let (tx, rx) = channel(1000);
         self.poll_commander
             .send(PollCommand::AddSubscriber(msg_id, None, tx))
             .await?;
@@ -421,5 +429,313 @@ impl Poller {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the two net-new fixes in this file:
+    //!
+    //! * **fix 12** (`81dc9a0`) — the poller supervisor busy-spun once the
+    //!   command channel closed.
+    //! * **subscriber depth 1000** (`ed4715b`) — one notch above upstream
+    //!   PR #399's 500.
+    //!
+    //! Where a test needs the pre-fix behaviour for comparison it reconstructs
+    //! the old expression inline and says so; the base tree is commit
+    //! `8708608` (upstream master + PRs #373/#400/#399/#398).
+
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+
+    /// A `BcConnSink` that swallows every message. The tests here never
+    /// inspect what the connection would have sent.
+    struct NullSink;
+
+    impl Sink<Bc> for NullSink {
+        type Error = Error;
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(self: Pin<&mut Self>, _: Bc) -> Result<()> {
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn null_sink() -> BcConnSink {
+        Box::new(NullSink)
+    }
+
+    /// A source that is already at end-of-stream, so the connection's
+    /// source-reading task finishes immediately and drops its clone of
+    /// `poll_commander`.
+    fn empty_source() -> BcConnSource {
+        Box::new(futures::stream::empty::<Result<Bc>>())
+    }
+
+    fn test_poller(depth: usize) -> (Sender<PollCommand>, Poller) {
+        let (cmd_tx, cmd_rx) = channel::<PollCommand>(depth);
+        let (sink_tx, sink_rx) = channel::<Result<Bc>>(depth);
+        // Keep the sink receiver alive for the life of the poller.
+        std::mem::forget(sink_rx);
+        (
+            cmd_tx,
+            Poller {
+                subscribers: Default::default(),
+                sink: sink_tx,
+                reciever: ReceiverStream::new(cmd_rx),
+            },
+        )
+    }
+
+    fn a_video_message(msg_num: u16) -> Bc {
+        Bc::new_from_meta(BcMeta {
+            msg_id: 3,
+            channel_id: 0,
+            stream_type: 0,
+            response_code: 200,
+            msg_num,
+            class: 0x6414,
+        })
+    }
+
+    /// utime+stime of one thread, in clock ticks (100 Hz on Linux/x86-64), read
+    /// from `/proc/self/task/<tid>/stat`. Per-*thread* on purpose: `cargo test`
+    /// runs test functions in parallel in one process, so a process-wide
+    /// counter would be polluted by whatever else is running.
+    fn thread_cpu_ticks(tid: u64) -> u64 {
+        let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat"))
+            .expect("this test needs procfs");
+        // Skip past "comm", which may itself contain spaces and parentheses.
+        let after_comm = &stat[stat.rfind(')').expect("malformed stat") + 2..];
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        // fields[0] is `state` (stat field 3), so utime (14) is fields[11] and
+        // stime (15) is fields[12].
+        fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+    }
+
+    fn this_thread_tid() -> u64 {
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").expect("this test needs procfs");
+        stat.split_whitespace().next().unwrap().parse().unwrap()
+    }
+
+    /// The precondition that made the pre-fix12 supervisor loop hot:
+    /// `Poller::run` returns `Ok(())` — not `Pending`, not an error — the
+    /// instant its command receiver is closed and drained, and it does so
+    /// again on every subsequent call.
+    #[tokio::test]
+    async fn poller_run_returns_ok_as_soon_as_its_command_channel_closes() {
+        let (cmd_tx, mut poller) = test_poller(8);
+        drop(cmd_tx);
+
+        for attempt in 0..5 {
+            let started = Instant::now();
+            let result = poller.run().await;
+            assert!(
+                result.is_ok(),
+                "attempt {attempt}: expected Ok on a closed channel, got {result:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(50),
+                "attempt {attempt}: run() took {:?}, so it did not return immediately",
+                started.elapsed()
+            );
+        }
+    }
+
+    /// The bug itself, measured. This is the exact pre-fix12 supervisor
+    /// expression from `BcConnection::new`
+    ///
+    /// ```ignore
+    /// loop { if let n @ Err(_) = poller.run().await { return n; } }
+    /// ```
+    ///
+    /// with one addition: a deadline, so the test terminates. The original had
+    /// no exit at all — that is the bug. On a closed channel it re-enters
+    /// `run()` as fast as the CPU allows and never yields, so `select!`'s
+    /// cancellation arm can never be polled.
+    #[tokio::test]
+    async fn pre_fix_supervisor_loop_spins_on_a_closed_command_channel() {
+        let (cmd_tx, mut poller) = test_poller(8);
+        drop(cmd_tx);
+
+        let window = Duration::from_millis(200);
+        let deadline = Instant::now() + window;
+        let mut re_entries: u64 = 0;
+        loop {
+            re_entries += 1;
+            if poller.run().await.is_err() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break; // not in the original
+            }
+        }
+
+        eprintln!(
+            "pre-fix supervisor re-entered Poller::run {re_entries} times in {} ms",
+            window.as_millis()
+        );
+        assert!(
+            re_entries > 10_000,
+            "expected a hot loop, only got {re_entries} re-entries in {window:?}"
+        );
+    }
+
+    /// Teardown must leave no thread burning CPU. Measured on the connection's
+    /// own runtime thread (`/proc/self/task/<tid>/stat`) for 500 ms after the
+    /// `BcConnection` is dropped.
+    ///
+    /// MEASURED, both trees, 0 ticks: this passes on base `8708608` too. The
+    /// pre-fix loop spun only on `Poller::run` returning `Ok(())`, i.e. the
+    /// command channel closing with every sender gone, and `Drop` does not
+    /// produce that state — it clones `poll_commander` into a task that sends
+    /// `PollCommand::Disconnect`, so `run()` returns `Err` and even the old
+    /// loop terminated. The `Ok(())` close is reachable only if every sender is
+    /// dropped without a `Disconnect` (the state kempson measured pegging a
+    /// core on a Frigate LXC); no route to it through this type's public API
+    /// was found. So this is a teardown-hygiene guard, not the bug repro — the
+    /// bug itself is measured by
+    /// `pre_fix_supervisor_loop_spins_on_a_closed_command_channel`.
+    #[test]
+    fn dropping_a_connection_leaves_no_spinning_runtime_thread() {
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel::<u64>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        // A dedicated current-thread runtime: everything the connection spawns
+        // runs on this one thread, so its CPU accounting is the whole story. It
+        // is deliberately detached — if the poller does spin, `block_on` never
+        // returns and joining would hang the test instead of failing it.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                tid_tx.send(this_thread_tid()).unwrap();
+                let conn = BcConnection::new(null_sink(), empty_source())
+                    .await
+                    .expect("connection");
+                // Let the source task reach end-of-stream and drop its clone of
+                // poll_commander.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(conn);
+                // Stay alive long enough to be measured from outside.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = done_tx.send(());
+            });
+        });
+
+        let tid = tid_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::thread::sleep(Duration::from_millis(300)); // setup + drop
+        let before = thread_cpu_ticks(tid);
+        let window = Duration::from_millis(500);
+        std::thread::sleep(window);
+        let after = thread_cpu_ticks(tid);
+        let burned = after - before;
+
+        eprintln!(
+            "connection runtime thread burned {burned} CPU ticks (~{} ms) in the {} ms after drop",
+            burned * 10,
+            window.as_millis()
+        );
+        assert!(
+            burned < 10,
+            "runtime thread burned {burned} ticks (~{} ms) of CPU in {window:?} after the \
+             connection was dropped — the poller is spinning",
+            burned * 10
+        );
+        let _ = done_rx.recv_timeout(Duration::from_secs(10));
+    }
+
+    /// The depth `subscribe()` actually hands out, measured end to end through
+    /// the real connection: feed the source more messages than the channel can
+    /// hold while the consumer reads none, then count what survived.
+    ///
+    /// `ed4715b` sets this to 1000, one notch above upstream PR #399's 500.
+    ///
+    /// The commit that raised it cites ~10 dropped messages a second on a 4K
+    /// HEVC camera at depth 500. That figure is from an earlier deployment and
+    /// was NOT reproducible this session: the running fleet already carries
+    /// depth 1000, and Loki shows 0 "Channel full, dropping message" lines
+    /// across all four cameras over 7 days. So the number below is what is
+    /// measured here; the 500-era rate is taken on trust.
+    #[tokio::test]
+    async fn subscribe_hands_out_a_thousand_deep_channel() {
+        let (src_tx, src_rx) = channel::<Result<Bc>>(4096);
+        let conn = BcConnection::new(null_sink(), Box::new(ReceiverStream::new(src_rx)))
+            .await
+            .expect("connection");
+        let mut sub = conn.subscribe(3, 1).await.expect("subscribe");
+
+        // Overfill by a wide margin, and never read from `sub`.
+        for _ in 0..1500 {
+            src_tx.send(Ok(a_video_message(1))).await.unwrap();
+        }
+        // Let the poller drain everything it is going to drain.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut held = 0;
+        while tokio::time::timeout(Duration::from_millis(20), sub.recv())
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false)
+        {
+            held += 1;
+        }
+        eprintln!("subscriber held {held} of 1500 messages before the poller started dropping");
+        assert_eq!(held, 1000, "subscriber channel depth");
+    }
+
+    /// What the depth buys, measured rather than asserted: a consumer that
+    /// pauses while the camera keeps pushing loses everything past the channel
+    /// depth, because `Poller` deliberately `try_send`s and drops rather than
+    /// blocking its message loop (blocking there is what starves the keepalive
+    /// ping and disconnects the camera).
+    ///
+    /// A 1000-frame burst is lossless at depth 1000 and loses half of itself at
+    /// PR #399's depth of 500.
+    #[tokio::test]
+    async fn a_thousand_message_burst_is_lossless_at_depth_1000_and_lossy_at_500() {
+        async fn delivered(depth: usize, burst: usize) -> usize {
+            let (cmd_tx, mut poller) = test_poller(burst + 8);
+            let (sub_tx, mut sub_rx) = channel::<Result<Bc>>(depth);
+            cmd_tx
+                .send(PollCommand::AddSubscriber(3, Some(1), sub_tx))
+                .await
+                .unwrap();
+            for _n in 0..burst {
+                cmd_tx
+                    .send(PollCommand::Bc(Box::new(Ok(a_video_message(1)))))
+                    .await
+                    .unwrap_or_else(|_| panic!("queueing message {_n}"));
+            }
+            drop(cmd_tx);
+            // Drains every queued command, then returns Ok on the closed channel.
+            poller.run().await.expect("poller drained cleanly");
+
+            let mut count = 0;
+            while sub_rx.try_recv().is_ok() {
+                count += 1;
+            }
+            count
+        }
+
+        let burst = 1000;
+        let at_1000 = delivered(1000, burst).await;
+        let at_500 = delivered(500, burst).await;
+        eprintln!(
+            "burst of {burst}: depth 1000 delivered {at_1000}, depth 500 (PR #399) delivered {at_500}"
+        );
+        assert_eq!(at_1000, burst, "depth 1000 should absorb the whole burst");
+        assert_eq!(at_500, 500, "depth 500 should drop everything past 500");
     }
 }
