@@ -193,7 +193,7 @@ pub(super) async fn make_dummy_factory(
 enum ClientMsg {
     NewClient {
         element: Element,
-        reply: tokio::sync::oneshot::Sender<Element>,
+        reply: std::sync::mpsc::SyncSender<Element>,
     },
 }
 
@@ -742,10 +742,30 @@ pub(super) async fn make_factory(
 
     // Now setup the factory
     let factory = NeoMediaFactory::new_with_callback(move |element| {
-        let (reply, new_element) = tokio::sync::oneshot::channel();
+        let (reply, new_element) = std::sync::mpsc::sync_channel(1);
         client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
 
-        let element = new_element.blocking_recv()?;
+        // BOUNDED wait — the load-bearing fix for the all-camera CLOSE_WAIT
+        // wedge (2026-06-18). This closure runs on gst-rtsp-server's single
+        // shared glib main-loop thread (create_element). The reply only comes
+        // after the per-camera tokio task drains ~10 BC frames to learn the
+        // codec and builds the bin; if that camera's stream is mid-reconnect
+        // or wedged, an unbounded recv blocks this thread FOREVER, freezing
+        // RTSP for EVERY camera → 200+ unanswered connections pile up in
+        // CLOSE_WAIT → camera_fps=0 everywhere; only `docker restart neolink`
+        // clears it. With a bounded recv the main loop blocks at most
+        // BUILD_REPLY_TIMEOUT per stuck connect, keeps serving the other
+        // cameras, and on timeout returns Err → build_pipeline maps it to
+        // "media restarting" (Ok(None)) → gst fails this DESCRIBE cleanly and
+        // closes the socket; go2rtc just retries until the stream is ready.
+        const BUILD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+        let element = new_element.recv_timeout(BUILD_REPLY_TIMEOUT).map_err(|e| {
+            log::warn!(
+                "create_element: pipeline build did not reply within {:?} ({e:?}) — failing this DESCRIBE so the shared glib main loop stays free for the other cameras",
+                BUILD_REPLY_TIMEOUT
+            );
+            e
+        })?;
         Ok(Some(element))
     })
     .await?;
