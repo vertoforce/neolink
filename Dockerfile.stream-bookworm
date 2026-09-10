@@ -1,0 +1,63 @@
+# Bookworm build of the `neolink` binary, for PIPE MODE ONLY.
+#
+# 2026-09-10: the production image (Dockerfile, `neolink:stream1`) is Debian
+# TRIXIE (glibc 2.41). Frigate's image — which is where go2rtc runs and
+# therefore where the `exec:` child is spawned — is Debian BOOKWORM with
+# glibc 2.36 (measured: `docker exec frigate ldd --version`). A trixie-built
+# binary cannot run there. So the binary that gets bind-mounted into Frigate is
+# built HERE against bookworm, and `stream-runtime/` is extracted from this
+# image.
+#
+# gst-rtsp-server is still LINKED (src/rtsp is compiled in and unchanged) but
+# is never CALLED in `neolink stream` — the muxer in src/stream/mpegts.rs is
+# hand-rolled Rust. That is why bookworm's gst 1.22 is acceptable here and the
+# `>= 1.24.9` runtime guard in the trixie Dockerfile is deliberately absent:
+# the dead-camera SIGABRT vector it guards (gst_rtsp_media_get_rates) lives on
+# the RTSP path, which pipe mode does not enter.
+#
+# Build:  docker build -f Dockerfile.stream-bookworm -t neolink:stream1-bookworm .
+# Extract: ./extract-stream-runtime.sh
+FROM docker.io/rust:slim-bookworm@sha256:ebd900bae66fd508b466cef82d64a83a5fb34682e4c8b2797a42908bddc95a57 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /usr/local/src/neolink
+COPY . /usr/local/src/neolink
+
+# hadolint ignore=DL3008
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      openssl \
+      libssl-dev \
+      ca-certificates \
+      libgstrtspserver-1.0-dev \
+      libgstreamer1.0-dev \
+      libgtk2.0-dev \
+      protobuf-compiler \
+      libglib2.0-dev && \
+    apt-get clean -y && rm -rf /var/lib/apt/lists/* ; \
+    pkg-config --modversion gstreamer-rtsp-server-1.0 ; \
+    cargo build --release
+
+# Optional target: `docker build -f Dockerfile.stream-bookworm --target test .`
+# runs the 8 stream-module unit tests (4 in src/stream/mod.rs clock/wrap, 4 in
+# src/stream/mpegts.rs muxer) against the same compiled tree.
+FROM build AS test
+RUN cargo test --release stream:: 2>&1 | tail -40
+
+FROM docker.io/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+
+# hadolint ignore=DL3008
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        openssl \
+        ca-certificates \
+        libgstrtspserver-1.0-0 \
+        libgstreamer1.0-0 && \
+    apt-get clean -y && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build \
+  /usr/local/src/neolink/target/release/neolink \
+  /usr/local/bin/neolink
+
+RUN chmod +x /usr/local/bin/neolink && /usr/local/bin/neolink --version
