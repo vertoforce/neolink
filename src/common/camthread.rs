@@ -129,7 +129,10 @@ impl NeoCamThread {
                             // BC connection every ~FRAME_STALENESS_MS; in this
                             // deployment every camera has a permanent preload /
                             // exec consumer, so frames always flow when healthy.
-                            if frames_stale(&last_frame_at) {
+                            if tick_declares_dead(
+                                PingTick::Answered,
+                                frames_stale(&last_frame_at),
+                            ) {
                                 log::error!(
                                     "{watchdog_name}: pings OK but no frames for >{FRAME_STALENESS_MS}ms — declaring camera dead (fix 13)"
                                 );
@@ -146,7 +149,10 @@ impl NeoCamThread {
                             // Fall through into a frames-only watchdog loop.
                             loop {
                                 interval.tick().await;
-                                if frames_stale(&last_frame_at) {
+                                if tick_declares_dead(
+                                    PingTick::Unsupported,
+                                    frames_stale(&last_frame_at),
+                                ) {
                                     log::error!(
                                         "{watchdog_name}: no frames for >{FRAME_STALENESS_MS}ms (pings unsupported), declaring camera dead"
                                     );
@@ -163,7 +169,13 @@ impl NeoCamThread {
                             // error, login revoked. Frames couldn't be
                             // flowing if the BC connection itself errored,
                             // so no need to consult last_frame_at here.
-                            break Err(e.into());
+                            if tick_declares_dead(
+                                PingTick::Failed,
+                                frames_stale(&last_frame_at),
+                            ) {
+                                break Err(e.into());
+                            }
+                            continue;
                         },
                         Err(_) => {
                             // Ping reply timeout. Under the old logic this
@@ -177,7 +189,10 @@ impl NeoCamThread {
                             // stopped (frames_stale returns true). Other BC
                             // errors above still tear down immediately.
                             missed_pings = missed_pings.saturating_add(1);
-                            let stale = frames_stale(&last_frame_at);
+                            let stale = tick_declares_dead(
+                                PingTick::TimedOut,
+                                frames_stale(&last_frame_at),
+                            );
                             if stale {
                                 log::error!(
                                     "{watchdog_name}: ping timeout #{missed_pings} AND no frames for >{FRAME_STALENESS_MS}ms — declaring camera dead"
@@ -309,6 +324,44 @@ pub(crate) fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// What one watchdog tick learned from the BC keepalive ping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PingTick {
+    /// The camera answered.
+    Answered,
+    /// The ping reply timed out.
+    TimedOut,
+    /// This camera does not implement BC pings at all.
+    Unsupported,
+    /// A real BC error: connection reset, protocol error, login revoked.
+    Failed,
+}
+
+/// Whether this tick must declare the camera dead and tear the BC connection
+/// down. Pure, so the policy can be table-tested; `run_camera`'s select arms
+/// are the only callers and each passes its own `frames_stale` reading.
+///
+/// The whole point of the frame-arrival watchdog (`681cc41`, `fix 13`) lives
+/// in this table: liveness is frames, not pings.
+pub(crate) fn tick_declares_dead(tick: PingTick, frames_stale: bool) -> bool {
+    match tick {
+        // fix 13. A camera that answers pings but has stopped delivering
+        // frames is dead — the camera C Mode-B wedge. Before fix 13 this arm
+        // ignored frames entirely and such a camera was never re-declared.
+        PingTick::Answered => frames_stale,
+        // 681cc41. A ping timeout on its own is informational: camera B
+        // saturates its encoder and misses replies every ~50-60s while frames
+        // keep flowing. Only a timeout WITH stale frames is a death; the old
+        // logic counted five misses and reconnected regardless.
+        PingTick::TimedOut => frames_stale,
+        // Pings unsupported: frames are the only signal there is.
+        PingTick::Unsupported => frames_stale,
+        // Real protocol errors still tear down immediately — frames cannot be
+        // flowing if the BC connection itself errored.
+        PingTick::Failed => true,
+    }
+}
+
 /// True if the last frame arrived more than `FRAME_STALENESS_MS` ago.
 ///
 /// Returns false when `last_frame_at == 0`, i.e. before any frame has arrived.
@@ -359,4 +412,140 @@ async fn update_camera_time(camera: &BcCamera, name: &str, update_time: bool) ->
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the frame-arrival watchdog: `681cc41` (BC-ping
+    //! liveness replaced by frame arrival), `f2385e8`/fix 5 (reconnect grace
+    //! window) and `60546ff`/fix 13 (staleness enforced on the ping-SUCCESS
+    //! arm too).
+    //!
+    //! The base tree is commit `8708608` — upstream master plus PRs
+    //! #373/#400/#399/#398 — whose watchdog has no concept of frames at all:
+    //! it counts five missed pings and forces a BC reconnect. That policy
+    //! cannot be linked against, so where a comparison is needed it is
+    //! reconstructed here as `base_tick_declares_dead` and labelled as such.
+
+    use super::*;
+
+    /// The pre-`681cc41` policy, reconstructed from the base tree: five missed
+    /// pings in a row is a death, frames are never consulted.
+    const BASE_MISSED_PING_LIMIT: u32 = 5;
+    fn base_tick_declares_dead(tick: PingTick, missed_pings: u32) -> bool {
+        match tick {
+            PingTick::Answered | PingTick::Unsupported => false,
+            PingTick::TimedOut => missed_pings >= BASE_MISSED_PING_LIMIT,
+            PingTick::Failed => true,
+        }
+    }
+
+    fn frame_at(ms_ago: u64) -> Arc<AtomicU64> {
+        Arc::new(AtomicU64::new(now_epoch_ms() - ms_ago))
+    }
+
+    #[test]
+    fn no_frame_yet_is_not_stale() {
+        // Zero means "nothing has arrived"; the connect path owns that case.
+        assert!(!frames_stale(&Arc::new(AtomicU64::new(0))));
+    }
+
+    #[test]
+    fn frames_go_stale_only_past_the_threshold() {
+        assert!(!frames_stale(&frame_at(0)));
+        assert!(!frames_stale(&frame_at(FRAME_STALENESS_MS - 1_000)));
+        assert!(frames_stale(&frame_at(FRAME_STALENESS_MS + 1_000)));
+    }
+
+    /// fix 5. Before the fix, `run_camera` left `last_frame_at` holding the
+    /// pre-disconnect timestamp, so a camera that had been down for a while was
+    /// judged against a clock that was already stale and got declared dead on
+    /// the first 5 s tick after logging back in — a connect/kill/reconnect loop
+    /// that never let a marginal-WiFi camera push its first frame.
+    #[test]
+    fn a_reconnect_restarts_the_grace_window() {
+        // The watchdog ticks every 5 s. Advancing the wall clock by t ticks is
+        // the same as pulling `last_frame_at` back by t * 5 s.
+        fn ticks_survived(stored: u64) -> usize {
+            (0..12)
+                .take_while(|t| {
+                    let probe = Arc::new(AtomicU64::new(stored.saturating_sub(t * 5_000)));
+                    !frames_stale(&probe)
+                })
+                .count()
+        }
+
+        // Two minutes of downtime, then a successful login.
+        let last_frame_at = frame_at(120_000);
+
+        // Base: no reset on connect, so the clock is already stale and the
+        // camera is declared dead on the very first tick after logging in.
+        assert!(frames_stale(&last_frame_at), "base: stale the moment it connects");
+        assert_eq!(
+            ticks_survived(last_frame_at.load(Ordering::Relaxed)),
+            0,
+            "base: dies on tick 0"
+        );
+
+        // Fixed (fix 5): run_camera stores now_epoch_ms() right after connect.
+        last_frame_at.store(now_epoch_ms(), Ordering::Relaxed);
+        assert!(!frames_stale(&last_frame_at), "fixed: fresh grace window");
+        // Survives ticks 0..=6 (0-30 s) and dies at tick 7 (35 s) — the whole
+        // of FRAME_STALENESS_MS is available for the first frame.
+        assert_eq!(
+            ticks_survived(last_frame_at.load(Ordering::Relaxed)),
+            (FRAME_STALENESS_MS / 5_000) as usize + 1,
+            "fixed: a full FRAME_STALENESS_MS of grace"
+        );
+    }
+
+    /// fix 13, the camera C Mode-B wedge: pings answered, frames stopped.
+    /// The base policy never looks at frames on a successful ping, so such a
+    /// camera is never re-declared dead and its RTSP pipeline wedges.
+    #[test]
+    fn pings_answered_with_dead_frames_is_a_death() {
+        assert!(tick_declares_dead(PingTick::Answered, true));
+        assert!(!base_tick_declares_dead(PingTick::Answered, 0));
+        // Healthy camera: unaffected.
+        assert!(!tick_declares_dead(PingTick::Answered, false));
+    }
+
+    /// `681cc41`, the camera B scenario: the panorama saturates its encoder
+    /// and misses ping replies while pumping frames at full rate. Count the
+    /// tear-downs each policy produces over a minute of that.
+    #[test]
+    fn missed_pings_with_frames_flowing_no_longer_tear_the_camera_down() {
+        let ticks = 12; // 12 x 5 s = 60 s
+        let mut base_deaths = 0;
+        let mut fixed_deaths = 0;
+        let mut missed = 0;
+        for _ in 0..ticks {
+            missed += 1;
+            if base_tick_declares_dead(PingTick::TimedOut, missed) {
+                base_deaths += 1;
+                missed = 0; // the base reconnected, resetting its counter
+            }
+            // Frames are arriving the whole time.
+            if tick_declares_dead(PingTick::TimedOut, false) {
+                fixed_deaths += 1;
+            }
+        }
+        eprintln!(
+            "60 s of missed pings with frames flowing: base tore the camera down \
+             {base_deaths} time(s), fixed {fixed_deaths}"
+        );
+        assert_eq!(base_deaths, 2);
+        assert_eq!(fixed_deaths, 0);
+    }
+
+    /// A ping timeout that coincides with stale frames is still a death, and a
+    /// real BC error is a death whatever the frames say.
+    #[test]
+    fn genuine_failures_still_tear_the_camera_down() {
+        assert!(tick_declares_dead(PingTick::TimedOut, true));
+        assert!(tick_declares_dead(PingTick::Unsupported, true));
+        assert!(!tick_declares_dead(PingTick::Unsupported, false));
+        assert!(tick_declares_dead(PingTick::Failed, false));
+        assert!(tick_declares_dead(PingTick::Failed, true));
+    }
 }
