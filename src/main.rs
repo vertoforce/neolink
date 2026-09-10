@@ -50,6 +50,7 @@ mod reboot;
 mod rtsp;
 mod services;
 mod statusled;
+mod stream;
 #[cfg(feature = "gstreamer")]
 mod talk;
 mod users;
@@ -146,6 +147,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Users(opts)) => {
             users::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Stream(opts)) => {
+            stream::main(opts, neo_reactor.clone()).await?;
         }
     }
 
