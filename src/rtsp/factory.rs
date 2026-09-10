@@ -59,7 +59,7 @@ const RTSP_EGRESS_STALENESS_MS: u64 = 15_000;
 
 /// fix 13: frame-pump watchdog tick (ms). The pump loop used to block
 /// indefinitely in `media_rx.blocking_recv()`, so EVERY check in the loop body
-/// (egress stall, post-EOS grace exit, audio stall) only executed when a frame
+/// (egress stall, post-EOS grace exit) only executed when a frame
 /// arrived — a frame-starved pump detected nothing, exited nothing, and logged
 /// nothing (the 2026-07-31 camera C Mode B wedge: camera reconnects, pings
 /// pass, pump starves, gst-rtsp-server keeps serving the cached prepared media
@@ -70,6 +70,50 @@ const RTSP_EGRESS_STALENESS_MS: u64 = 15_000;
 /// which assume one iteration == one push attempt — see the `let Some(data)`
 /// gate in the loop.
 const PUMP_RECV_TICK_MS: u64 = 5_000;
+
+/// fix 15: ORPHAN frame-pump guard — consecutive empty 5s ticks
+/// (PUMP_RECV_TICK_MS) on which the appsrc is found DETACHED from its bin
+/// before the pump exits.
+///
+/// Measured leak (camera-d, 72h to 2026-08-28): 49 extra
+/// threads all parked in pump_recv_timeout's nanosleep, +~500 MB RSS, +~540
+/// socket FDs (BufferPool socketpairs). An orphan is a pump whose pipeline
+/// is gone (media unprepared after its clients left, or a bin that was never
+/// handed to gst-rtsp-server because its DESCRIBE timed out — fix 6) AND
+/// whose camera subscription went quiet: media_rx is EMPTY but OPEN (its
+/// media_tx lives in the `stream()` task's run_passive_task loop, which only
+/// ends when a send fails — i.e. only after the pump drops media_rx: a
+/// circular wait). Every pre-fix15 exit needed a FRAME to run its check
+/// (the fix 4 detach fast-exit only tests check_live inside the push path)
+/// or egress to have started, so such a pump spun on ticks forever holding
+/// pools + subscription.
+///
+/// Guard: on each empty tick re-run the SAME terminal test fix 4 uses
+/// (check_live: appsrc has no bus => it left the bin; never recoverable for
+/// THIS pipeline) and fast-exit after this many consecutive detached ticks.
+/// Probe-independent by design: a first version keyed on "pay0 egress
+/// counter still 0 after 60s" was iso-measured killing a pipeline that was
+/// serving 3 consumers at 15 fps — the pay0 BUFFER pad probe never fires
+/// when the payloader pushes fragmented NALs as buffer LISTS, so "no egress
+/// counted" is not evidence of no egress. Detachment is.
+const ORPHAN_DETACHED_TICKS: u32 = 3;
+
+/// fix 6: how long create_element (on gst-rtsp-server's single shared glib
+/// main-loop thread) waits for the per-camera task to build the bin before
+/// failing the DESCRIBE. Canonical location — see the create_element
+/// callback in make_factory for the full rationale.
+const BUILD_REPLY_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// fix 15: a pipeline build whose learn phase (draining the first BC frames
+/// to discover codec/audio type) has not completed this long after it was
+/// requested can no longer be delivered to anyone — its DESCRIBE gave up at
+/// BUILD_REPLY_TIMEOUT. Pre-fix15 such builds sat parked in
+/// `media_rx.recv()` forever (iso-measured: 7 of 16 timed-out builds never
+/// completed), each holding the bin, the buffered frames and a BC
+/// start_video subscription. Abandon them instead (2x the requester's wait so
+/// the requester is provably gone; a build that completes inside the window
+/// is unaffected).
+const BUILD_LEARN_ABANDON: Duration = Duration::from_secs(2 * BUILD_REPLY_TIMEOUT.as_secs());
 
 /// fix 14: DESCRIBE liveness gate — grace for the never-connected case.
 ///
@@ -423,7 +467,20 @@ pub(super) async fn make_factory(
                         let mut frame_count = 0usize;
 
                         let mut stream_config = StreamConfig::new(&camera, stream).await?;
-                        while let Some(media) = media_rx.recv().await {
+                        // fix 15: bounded learn phase — see BUILD_LEARN_ABANDON.
+                        let learn_deadline = tokio::time::Instant::now() + BUILD_LEARN_ABANDON;
+                        loop {
+                            let media = match tokio::time::timeout_at(learn_deadline, media_rx.recv()).await {
+                                Ok(Some(media)) => media,
+                                Ok(None) => break,
+                                Err(_elapsed) => {
+                                    log::info!(
+                                        "{name}::{stream}: pipeline build abandoned — no stream type learned within {:?} (requesting DESCRIBE gave up at {:?}); dropping bin + camera subscription (fix 15)",
+                                        BUILD_LEARN_ABANDON, BUILD_REPLY_TIMEOUT
+                                    );
+                                    return AnyResult::Ok(());
+                                }
+                            };
                             stream_config.update_from_media(&media);
                             buffer.push(media);
                             if frame_count > 10
@@ -537,8 +594,29 @@ pub(super) async fn make_factory(
                         }
 
                         log::trace!("{name}::{stream}: Sending pipeline to gstreamer");
-                        // Send the pipeline back to the factory so it can start
-                        let _ = reply.send(element);
+                        // Send the pipeline back to the factory so it can start.
+                        //
+                        // fix 15: if the DESCRIBE that asked for this build
+                        // already gave up (create_element's BUILD_REPLY_TIMEOUT,
+                        // fix 6 — its Receiver is gone, so send() fails), this
+                        // bin will never be handed to gst-rtsp-server and no
+                        // client can ever attach to it. Spawning the frame-pump
+                        // anyway (pre-fix15 behaviour) created an unowned
+                        // thread holding media_rx — the orphan leak described at
+                        // ORPHAN_DETACHED_TICKS. Discard everything here
+                        // instead: dropping `element` (returned inside the
+                        // SendError) finalizes the bin, dropping `media_rx` ends
+                        // the BC start_video subscription (the stream task's
+                        // next send fails and run_passive_task returns), and no
+                        // pools/thread are ever created. The factory simply
+                        // rebuilds on the client's retry.
+                        if let Err(e) = reply.send(element) {
+                            drop(e);
+                            log::info!(
+                                "{name}::{stream}: pipeline built after its DESCRIBE gave up (build-reply timeout) — discarding bin + camera subscription, not spawning a frame-pump (fix 15)"
+                            );
+                            return AnyResult::Ok(());
+                        }
 
                         // Run blocking code on a seperate thread
                         // This is not an async thread
@@ -548,9 +626,6 @@ pub(super) async fn make_factory(
                             let mut aud_ts: u64 = 0;
                             let mut vid_ts: u64 = 0;
                             let mut pools = Default::default();
-                            // fix 8: per-track last-successful-push clocks for
-                            // the audio-stall exit (see check below).
-                            let mut push_times = PushTimes::default();
                             // Thread lifecycle: drop the frame and keep going
                             // on transient send errors, but EXIT after EOS so
                             // the next client connection rebuilds cleanly via
@@ -699,35 +774,28 @@ pub(super) async fn make_factory(
                             // briefly, the new thread spawns first). Empirically
                             // a ~2.5s grace is plenty.
                             const POST_EOS_GRACE: u32 = 50;
-                            // AUDIO-STALL exit (fix 8). Motivating incident
-                            // 2026-07-03: camera A's long-lived RTSP session went
-                            // AUDIO-ONLY wedged — video kept flowing but the
-                            // audio track delivered ~60 packets then went
-                            // permanently silent (a FRESH session to the same
-                            // camera had working audio). Browser MSE players
-                            // spin forever on the empty audio track. No
-                            // existing watchdog catches this: egress (pay0 =
-                            // video) advances, sends succeed, no errors, no
-                            // back-pressure. If the stall is neolink-side,
-                            // exiting the pump so the factory rebuilds the
-                            // session self-heals it. Guards (ALL required):
-                            //   (a) this stream advertises audio (aud_src set),
-                            //   (b) audio pushed successfully at least once
-                            //       this session (audio flowed, THEN stopped —
-                            //       video-only / audio-disabled sessions can
-                            //       never trip),
-                            //   (c) no successful audio push for >=
-                            //       AUDIO_STALL_EXIT_SECS,
-                            //   (d) video pushed successfully within the last
-                            //       AUDIO_STALL_VIDEO_FRESH_MS (whole-stream
-                            //       outages/reconnects stay owned by the
-                            //       existing watchdogs and never trip this).
-                            // Exit reuses the egress-stall EOS machinery
-                            // verbatim (EOS both srcs → EGRESS_POST_EOS_GRACE_MS
-                            // → the same terminal break fix 4 established) —
-                            // no new teardown mechanics.
-                            const AUDIO_STALL_EXIT_SECS: u64 = 10;
-                            const AUDIO_STALL_VIDEO_FRESH_MS: u64 = 2_000;
+                            // fix 15 — the fix 8 AUDIO-STALL exit that used
+                            // to live here is REMOVED. It was speculative (one
+                            // unconfirmed camera A incident 2026-07-03, never
+                            // recurred) and measured as a pure false-positive
+                            // generator: 183 fires in 72h on camera_d,
+                            // EVERY one preceded ~10-15s earlier by camera BC
+                            // ping timeouts and followed within 0-3s by "BC
+                            // ping recovered" — i.e. it tore down the shared
+                            // pipeline (EOS, pool re-alloc, go2rtc/ffmpeg
+                            // reconnect, 139 frigate "Unable to read frames"
+                            // in 72h) exactly as a transient camera hiccup was
+                            // resolving itself. Audio on these streams is
+                            // continuous when healthy (120s ffprobe: 5625 audio
+                            // pkts, max gap 0.02s) and isn't even consumed by
+                            // the _norm re-encoders. Whole-stream stalls stay
+                            // owned by the egress-stall / starvation exits.
+
+                            // fix 15: consecutive empty ticks on which the
+                            // appsrc was found detached (orphan guard). Tick-
+                            // only — separate from the push-path
+                            // consecutive_detached counter.
+                            let mut detached_ticks: u32 = 0;
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
@@ -739,7 +807,6 @@ pub(super) async fn make_factory(
                                     &mut vid_ts,
                                     &mut aud_ts,
                                     &stream_config,
-                                    &mut push_times,
                                 );
                             }
 
@@ -884,34 +951,27 @@ pub(super) async fn make_factory(
                                         eos_signaled = true;
                                         egress_eos_at = now_ms;
                                     }
-                                    // Independent of the egress if/else chain
-                                    // above (which takes the "counter advanced"
-                                    // branch on virtually every frame while
-                                    // video flows — exactly when THIS check
-                                    // must run).
-                                    if egress_eos_at == 0
-                                        && aud_src.is_some()
-                                        && push_times.audio_ms != 0
-                                        && now_ms.saturating_sub(push_times.audio_ms)
-                                            >= AUDIO_STALL_EXIT_SECS * 1000
-                                        && push_times.video_ms != 0
-                                        && now_ms.saturating_sub(push_times.video_ms)
-                                            <= AUDIO_STALL_VIDEO_FRESH_MS
-                                    {
-                                        // Audio-stall exit (fix 8) — see the
-                                        // AUDIO_STALL_EXIT_SECS doc-comment.
-                                        log::warn!(
-                                            "{name}::{stream}: audio stalled {}s while video flows — exiting frame-pump so factory rebuilds session (fix 8)",
-                                            now_ms.saturating_sub(push_times.audio_ms) / 1000
-                                        );
-                                        if let Some(src) = vid_src.as_ref() {
-                                            let _ = src.end_of_stream();
+                                    // fix 15: ORPHAN guard — see the
+                                    // ORPHAN_DETACHED_TICKS doc-comment. Only on
+                                    // empty ticks (a frame runs the real push-
+                                    // path check_live instead). The appsrc
+                                    // having no bus is the fix 4 terminal
+                                    // condition; with an EMPTY media_rx nothing
+                                    // else could ever observe it.
+                                    if data.is_none() {
+                                        let detached = vid_src
+                                            .as_ref()
+                                            .or(aud_src.as_ref())
+                                            .is_some_and(|src| check_live(src).is_err());
+                                        detached_ticks =
+                                            if detached { detached_ticks + 1 } else { 0 };
+                                        if detached_ticks >= ORPHAN_DETACHED_TICKS {
+                                            log::info!(
+                                                "{name}::{stream}: appsrc detached for {} idle ticks with no camera frames — orphan pipeline, fast-exiting frame-pump to free pools + camera subscription (fix 15)",
+                                                detached_ticks
+                                            );
+                                            break;
                                         }
-                                        if let Some(src) = aud_src.as_ref() {
-                                            let _ = src.end_of_stream();
-                                        }
-                                        eos_signaled = true;
-                                        egress_eos_at = now_ms;
                                     }
                                 }
                                 // fix 13: tick-only iteration (no frame) — the
@@ -949,7 +1009,6 @@ pub(super) async fn make_factory(
                                     &mut vid_ts,
                                     &mut aud_ts,
                                     &stream_config,
-                                    &mut push_times,
                                 ) {
                                     Ok(SendOutcome::Sent) => {
                                         if consecutive_errors > 0 {
@@ -1082,8 +1141,8 @@ pub(super) async fn make_factory(
                             // pipeline can never deliver another frame: the
                             // appsrc is detached (terminal fast-exit, fix 4),
                             // or we EOS'd and gave up (error / back-pressure /
-                            // egress-stall / audio-stall paths), or media_rx
-                            // closed. All of those paths end with the same
+                            // egress-stall / starvation / orphan paths), or
+                            // media_rx closed. All of those paths end with the same
                             // contract: "the factory rebuilds on the next
                             // client connect". The camera C storm proved that
                             // contract can never complete on its own: during a
@@ -1166,7 +1225,9 @@ pub(super) async fn make_factory(
         // cameras, and on timeout returns Err → build_pipeline maps it to
         // "media restarting" (Ok(None)) → gst fails this DESCRIBE cleanly and
         // closes the socket; go2rtc just retries until the stream is ready.
-        const BUILD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+        // (fix 15: the build task itself abandons a learn phase that outlives
+        // this wait — BUILD_LEARN_ABANDON — and discards a bin whose reply
+        // finds this receiver gone, so a timed-out build leaks nothing.)
         let element = new_element.recv_timeout(BUILD_REPLY_TIMEOUT).map_err(|e| {
             log::warn!(
                 "create_element: pipeline build did not reply within {:?} ({e:?}) — failing this DESCRIBE so the shared glib main loop stays free for the other cameras",
@@ -1190,15 +1251,6 @@ pub(super) async fn make_factory(
 pub(crate) enum SendOutcome {
     Sent,
     BackPressured,
-}
-
-/// fix 8: epoch-ms of the last SUCCESSFUL (Sent, not back-pressured, not
-/// dropped-on-near-full) push into each appsrc. Written by send_to_sources,
-/// read by the frame-pump's audio-stall check. 0 = never pushed this session.
-#[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct PushTimes {
-    pub(crate) video_ms: u64,
-    pub(crate) audio_ms: u64,
 }
 
 /// fix 11: rate-limited "video appsrc near capacity" log. With
@@ -1234,7 +1286,6 @@ fn send_to_sources(
     vid_ts: &mut u64,
     aud_ts: &mut u64,
     stream_config: &StreamConfig,
-    push_times: &mut PushTimes,
 ) -> AnyResult<SendOutcome> {
     // Track whether ANY push in this call hit Flushing. The video path is
     // the only one that drives back-pressure recovery — audio is dropped
@@ -1252,14 +1303,13 @@ fn send_to_sources(
                     log::debug!("Audio buffer near capacity, dropping AAC frame");
                 } else {
                     log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts));
-                    match send_to_appsrc(
+                    if let SendOutcome::BackPressured = send_to_appsrc(
                         aud_src,
                         aac.data,
                         Duration::from_micros(*aud_ts),
                         pools,
                     )? {
-                        SendOutcome::BackPressured => outcome = SendOutcome::BackPressured,
-                        SendOutcome::Sent => push_times.audio_ms = now_epoch_ms(),
+                        outcome = SendOutcome::BackPressured;
                     }
                 }
             }
@@ -1275,14 +1325,13 @@ fn send_to_sources(
                     log::debug!("Audio buffer near capacity, dropping ADPCM frame");
                 } else {
                     log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts));
-                    match send_to_appsrc(
+                    if let SendOutcome::BackPressured = send_to_appsrc(
                         aud_src,
                         adpcm.data,
                         Duration::from_micros(*aud_ts),
                         pools,
                     )? {
-                        SendOutcome::BackPressured => outcome = SendOutcome::BackPressured,
-                        SendOutcome::Sent => push_times.audio_ms = now_epoch_ms(),
+                        outcome = SendOutcome::BackPressured;
                     }
                 }
             }
@@ -1309,9 +1358,10 @@ fn send_to_sources(
                     log_video_near_full(vid_src);
                 }
                 log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
-                match send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)? {
-                    SendOutcome::BackPressured => outcome = SendOutcome::BackPressured,
-                    SendOutcome::Sent => push_times.video_ms = now_epoch_ms(),
+                if let SendOutcome::BackPressured =
+                    send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?
+                {
+                    outcome = SendOutcome::BackPressured;
                 }
             }
             const MICROSECONDS: u64 = 1000000;
