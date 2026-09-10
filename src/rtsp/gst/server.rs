@@ -39,6 +39,83 @@ impl Default for NeoRtspServer {
     }
 }
 
+/// Per-session keepalive timeout handed to gst-rtsp-server (seconds).
+///
+/// Canonical location for the "30" that was previously a magic literal in the
+/// `connect_new_session` handler. A healthy RTSP client (go2rtc preload,
+/// Frigate ffmpeg) refreshes its session well inside this window via RTCP /
+/// keepalive, so the value only governs how long an ABANDONED session lingers
+/// before `RTSPSessionPool::cleanup()` reaps it. Kept at 30s: smaller risks
+/// dropping a briefly-slow ffmpeg client; the stale-reap sweep below collapses
+/// the half-dead (CLOSE_WAIT) window without touching this floor.
+const SESSION_TIMEOUT_SECS: u32 = 30;
+
+/// Stale-session reap margin for the periodic sweep (milliseconds).
+///
+/// WHY THIS EXISTS (root cause, measured 2026-06-01): camera B repeatedly
+/// entered a non-self-healing `App source is closed` rebuild loop that only an
+/// EXTERNAL container restart cleared (incidents 074224Z / 165009Z). The
+/// frame-pump EOS+exit path fired and `create_element` DID rebuild the
+/// pipeline, but the rebuild never stuck. At the wedge there were 9 RTSP
+/// sessions stuck in CLOSE_WAIT on :8554, and the `connect_closed` reap
+/// (commit d4b516b) had logged `reaped` ZERO times — because CLOSE_WAIT means
+/// the peer half-closed and gst-rtsp-server's `closed` signal never fires.
+/// With `set_shared(true)` + `SuspendMode::Reset`, the shared media stays
+/// PREPARED while ANY session references it, so those zombie sessions blocked
+/// a clean unprepare → the rebuilt appsrc inherited a torn-down media and
+/// re-hit `App source is closed`, storming until segment-watchdog bounced the
+/// process. camera B (5120 panorama) churns connections hardest (~6× the
+/// wedge rate of camera A), so it lost this race first.
+///
+/// THE GAP: `connect_closed` covers clean TCP close; `cleanup()` only reaps at
+/// the full 30s `SESSION_TIMEOUT_SECS`. A CLOSE_WAIT session sits in between
+/// for up to ~30s — long enough to sustain the storm. This sweep additively
+/// reaps a session that has gone quiet (stopped being touched by RTCP /
+/// keepalive — exactly what happens when the peer half-closes into CLOSE_WAIT)
+/// SOONER than the full timeout, WITHOUT lowering the 30s floor that protects
+/// legitimately-slow clients on the clean path.
+///
+/// HOW WE DETECT "quiet" — correctly this time. `next_timeout_usec(now)`
+/// returns, despite its name, the **milliseconds remaining until expiry**
+/// (upstream `rtsp-session.c`: `res = GST_TIME_AS_MSECONDS(last_access - now)`,
+/// clamped at 0; the `usec` refers to the `now` arg, which is monotonic µs).
+/// A freshly-touched session reports `remaining ≈ timeout*1000` ms; as the
+/// client goes quiet `remaining` decays toward 0. We therefore compute, ALL IN
+/// MILLISECONDS:
+///   since_touch_ms = timeout_ms - remaining_ms        (how long since touched)
+/// and reap when `since_touch_ms >= timeout_ms - SESSION_STALE_REAP_MARGIN_MS`,
+/// i.e. once the session is within MARGIN of its own expiry. Equivalently:
+/// reap when `0 < remaining_ms <= SESSION_STALE_REAP_MARGIN_MS`.
+///
+/// Attempt #1 (neolink:local fix, reverted) got this WRONG two ways, proven
+/// 2026-06-01: (1) it compared `remaining` (ms) against `timeout_us`
+/// (microseconds), so `since_touch` was ALWAYS ≥ ~29.97e6 and EVERY session —
+/// including freshly-touched active ones — exceeded the threshold and was
+/// reaped, instantly storming `App source is closed` and zeroing all cams;
+/// (2) it guarded its log with `if !reaped.is_empty()`, but `filter()` returns
+/// only the sessions for which the closure returned `Ref` (per the C API:
+/// "a GList with all sessions for which func returned GST_RTSP_FILTER_REF"),
+/// never the Removed ones — so `reaped` was always empty and the damage was
+/// silent. This version keeps everything in ms and counts removals itself.
+///
+/// 5s margin: `remaining` only drops this low when the client hasn't been
+/// touched for ~25s of a 30s timeout — far past any healthy keepalive interval
+/// (go2rtc preload / Frigate ffmpeg refresh every few seconds), so a live
+/// session is never in this band; yet it fires ~5s before the 30s `cleanup()`
+/// would, and the 2s sweep cadence means a genuinely dead session is gone
+/// within ~5-7s of crossing the line instead of lingering the full 30s.
+/// Overridable via NEOLINK_RTSP_SESSION_STALE_REAP_MARGIN_MS for tuning
+/// against observed values without a rebuild.
+const SESSION_STALE_REAP_MARGIN_MS: i64 = 5_000;
+
+fn session_stale_reap_margin_ms() -> i64 {
+    std::env::var("NEOLINK_RTSP_SESSION_STALE_REAP_MARGIN_MS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(SESSION_STALE_REAP_MARGIN_MS)
+}
+
 impl NeoRtspServer {
     pub(crate) fn new() -> AnyResult<Self> {
         gstreamer::init().context("Gstreamer failed to initialise")?;
@@ -65,7 +142,7 @@ impl NeoRtspServer {
                 // Too long causes too many open connections with
                 // clients like frigate (that seem to open multiple
                 //   connections without shutting down old ones)
-                session.set_timeout(30);
+                session.set_timeout(SESSION_TIMEOUT_SECS);
             });
             // Proactive session reap on TCP close. Without this, when a
             // client's TCP connection drops without a TEARDOWN (common with
@@ -124,20 +201,74 @@ impl NeoRtspServer {
                     if cleanups > 0 {
                         log::debug!("Cleaned up {cleanups} sessions");
                     }
+                    // Stale-session reap (additive net for the CLOSE_WAIT case;
+                    // see SESSION_STALE_REAP_MARGIN_MS doc-comment for the full
+                    // root cause). `cleanup()` above only removes sessions past
+                    // the full SESSION_TIMEOUT_SECS; the `connect_closed` hook
+                    // only covers clean TCP close. Neither catches a half-closed
+                    // (CLOSE_WAIT) client that has stopped being touched but is
+                    // not yet expired — and those zombie sessions hold the
+                    // SHARED media PREPARED, blocking the EOS-driven rebuild
+                    // from ever sticking.
+                    //
+                    // ALL ARITHMETIC IN MILLISECONDS. `next_timeout_usec(now)`
+                    // returns ms-remaining-to-expiry (clamped at 0); `now` is
+                    // monotonic µs (the `usec` in the name is the arg, not the
+                    // return). A live session reports remaining ≈ timeout_ms; a
+                    // quiet/half-dead one decays toward 0. We reap only the
+                    // narrow band just before expiry, so a session that is
+                    // still being keepalive-touched (any healthy client) is
+                    // NEVER in range. We count removals ourselves because
+                    // `filter()` returns only the Ref'd sessions, not the
+                    // Removed ones.
+                    let margin_ms = session_stale_reap_margin_ms();
+                    let now = glib::monotonic_time();
+                    let mut reaped_count: usize = 0;
+                    let mut reaped_dbg: Vec<(Option<glib::GString>, i64)> = Vec::new();
                     sessions.filter(Some(&mut |_, session| {
-                        let remaining = session.next_timeout_usec(glib::monotonic_time());
+                        let timeout_ms = (session.timeout() as i64).saturating_mul(1000);
+                        let remaining_ms = session.next_timeout_usec(now) as i64;
+                        let since_touch_ms = timeout_ms.saturating_sub(remaining_ms);
                         log::debug!(
-                            "{:?}: {}/{}",
+                            "{:?}: remaining_ms={} timeout_ms={} since_touch_ms={}",
                             session.sessionid(),
-                            remaining,
-                            session.timeout(),
+                            remaining_ms,
+                            timeout_ms,
+                            since_touch_ms,
                         );
-                        RTSPFilterResult::Keep
+                        // Reap iff the session has a real (non-zero) timeout AND
+                        // its remaining-to-expiry has decayed into the narrow
+                        // pre-expiry margin (0 < remaining <= margin). A
+                        // freshly-/recently-touched live session has remaining
+                        // far above the margin, so it is never reaped here. We
+                        // require remaining > 0 so we don't double-handle a
+                        // session `cleanup()` already expired this same pass.
+                        if timeout_ms > 0 && remaining_ms > 0 && remaining_ms <= margin_ms {
+                            reaped_count += 1;
+                            reaped_dbg.push((session.sessionid(), remaining_ms));
+                            RTSPFilterResult::Remove
+                        } else {
+                            RTSPFilterResult::Keep
+                        }
                     }));
+                    if reaped_count > 0 {
+                        log::info!(
+                            "RTSP stale-session sweep — reaped {} half-dead session(s) (remaining<={}ms of {}s timeout, peer likely CLOSE_WAIT): {:?}",
+                            reaped_count,
+                            margin_ms,
+                            SESSION_TIMEOUT_SECS,
+                            reaped_dbg,
+                        );
+                    }
                 }
                 // 2s sweep handles the residual case where `closed` didn't
                 // fire (e.g. client TCP RST without protocol close); the
-                // closed-signal hook covers the common path.
+                // closed-signal hook covers the common path. The stale-reap
+                // filter above additionally collapses the CLOSE_WAIT window
+                // (peer half-closed, `closed` signal never fires) that fed the
+                // camera B rebuild storm — reaping such a session ~5s before
+                // the 30s `cleanup()` would, without touching the 30s floor for
+                // legitimately-slow clients on the clean path.
                 std::thread::sleep(Duration::from_secs(2));
             }
             AnyResult::Ok(())
