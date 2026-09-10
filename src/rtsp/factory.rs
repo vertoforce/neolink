@@ -928,6 +928,31 @@ pub(crate) struct PushTimes {
     pub(crate) audio_ms: u64,
 }
 
+/// fix 11: rate-limited "video appsrc near capacity" log. With
+/// leaky-type=downstream the appsrc silently drops the oldest buffered frame
+/// when full; this keeps those drops observable without spamming (the old
+/// drop-newest code logged per dropped frame). Rate limit is process-global
+/// (at most one line / 5s across all cameras) — enough signal, no flood.
+fn log_video_near_full(appsrc: &AppSrc) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_LOG_MS: AtomicU64 = AtomicU64::new(0);
+    const MIN_INTERVAL_MS: u64 = 5000;
+    let now = now_epoch_ms();
+    let prev = LAST_LOG_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(prev) >= MIN_INTERVAL_MS
+        && LAST_LOG_MS
+            .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        log::debug!(
+            "{}: video appsrc near capacity ({} / {} bytes) — leaky-downstream dropping oldest frames",
+            appsrc.name(),
+            appsrc.current_level_bytes(),
+            appsrc.max_bytes()
+        );
+    }
+}
+
 fn send_to_sources(
     data: BcMedia,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
@@ -993,25 +1018,27 @@ fn send_to_sources(
         BcMedia::Iframe(BcMediaIframe { data, .. })
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
-                // Mirror the audio drop-on-near-full (upstream PR #399)
-                // for the video path too. Without this, a backpressure
-                // spike on the video appsrc caused `send_to_appsrc` to
-                // fail → the frame-pump thread exited via `r?` → shared
-                // pipeline orphaned → 1h+ DESCRIBE wedge (observed
-                // 2026-04-21 06:28 "Buffer full on vidsrc" → silent
-                // starve until segment-watchdog bounced neolink 1h 13m
-                // later). Dropping a frame leaves a brief visual glitch
-                // until the next keyframe; a wedged pipeline leaves a
-                // black stream for minutes.
+                // fix 11: drop-OLDEST-under-pressure (was drop-NEWEST via
+                // a34c36c). The video appsrc now carries leaky-type=downstream
+                // (set in pipe_h264/pipe_h265), so when its internal queue hits
+                // max-bytes it discards the OLDEST buffered frame and enqueues
+                // this fresh one — bounding egress latency. The old a34c36c
+                // guard skipped pushing the NEW frame when >=90% full, which
+                // left stale frames queued and let latency grow under sustained
+                // back-pressure (lesson from PR #400 discussion / LinuxMainframe
+                // 16-camera fix). We therefore always push here; the appsrc
+                // self-bounds by dropping oldest. `send_to_appsrc` still guards
+                // the terminal "App source is closed" detach path (check_live)
+                // and back-pressure Flushing — those protections are unchanged.
+                // A rate-limited near-full log keeps the leaky drops observable.
                 let max = vid_src.max_bytes();
                 if max > 0 && vid_src.current_level_bytes() >= max * 9 / 10 {
-                    log::debug!("Video buffer near capacity, dropping video frame");
-                } else {
-                    log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
-                    match send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)? {
-                        SendOutcome::BackPressured => outcome = SendOutcome::BackPressured,
-                        SendOutcome::Sent => push_times.video_ms = now_epoch_ms(),
-                    }
+                    log_video_near_full(vid_src);
+                }
+                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
+                match send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)? {
+                    SendOutcome::BackPressured => outcome = SendOutcome::BackPressured,
+                    SendOutcome::Sent => push_times.video_ms = now_epoch_ms(),
                 }
             }
             const MICROSECONDS: u64 = 1000000;
@@ -1220,6 +1247,16 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
 
     source.set_is_live(false);
     source.set_block(false);
+    // fix 11: leaky-type=downstream — when the internal queue reaches
+    // max-bytes, drop the OLDEST buffered frame and enqueue the new one,
+    // rather than accumulating stale frames (growing latency) or wedging.
+    // Lesson from PR #400's discussion (LinuxMainframe's 16-camera fix):
+    // under sustained downstream back-pressure you want to shed stale data,
+    // not the fresh frame. Property added in GStreamer 1.20; our runtime is
+    // bookworm's 1.22. Set via property-string (same style as the wave/
+    // emit-signals props here) so it is a no-op-safe runtime property set.
+    // Video only — audio keeps its simpler drop-newest skip (buffers tiny).
+    source.set_property_from_str("leaky-type", "downstream");
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
@@ -1271,6 +1308,10 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
     source.set_is_live(false);
     source.set_block(false);
+    // fix 11: leaky-type=downstream — drop OLDEST buffered frame under
+    // pressure instead of accumulating stale frames. See pipe_h264 for the
+    // full rationale (PR #400 discussion, GStreamer 1.20+ property).
+    source.set_property_from_str("leaky-type", "downstream");
     source.set_min_latency(1000 / (stream_config.fps as i64));
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
