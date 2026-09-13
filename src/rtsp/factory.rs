@@ -600,6 +600,42 @@ fn liveness_gate_dead(
     }
 }
 
+/// The DESCRIBE gate as installed on both factories (`set_describe_gate`,
+/// evaluated in the factory's `construct` vfunc, gst/factory.rs). It wraps
+/// `liveness_gate_dead` with the two facts that predicate cannot see:
+///
+/// * `bc_connected`: the camthread currently holds a live BC session
+///   (`camera_watch` upgrades). A connected camera is never refused: the
+///   frame clock alone cannot tell "dead" from "connected with no consumer",
+///   and the DESCRIBE being refused is the consumer whose frames would prove
+///   it alive. The 60 s staleness budget only held in a deployment where
+///   every camera has a permanent consumer and the fix 13 idle reconnect
+///   cycle (~45 s on a LAN camera: 35 s to declare, 5 s backoff, login,
+///   4 s settle) completes inside it; a slower login, or no consumer on a
+///   camera that neolink keeps connected, blows through it (issue #202,
+///   sonntam 2026-09-12: gate line on a camera whose factory had mounted,
+///   i.e. one that HAD logged in).
+/// * `idle_disconnect`: the config asks neolink to drop the BC session 30 s
+///   after the last consumer leaves (neocam.rs). A dead session is then the
+///   expected idle state and the DESCRIBE is what takes the permit that
+///   reconnects it, so it must never be gated.
+///
+/// What is still refused: a camera with no BC session whose frame clock is
+/// past the threshold (powered off after a session; reconnects failing) and
+/// a never-connected camera past NEVER_CONNECTED_GRACE_MS. Those are the two
+/// states fix 14 was written for.
+fn describe_gate_dead(
+    bc_connected: bool,
+    idle_disconnect: bool,
+    last_frame_at: &Arc<AtomicU64>,
+    armed_at: &std::time::Instant,
+) -> bool {
+    if idle_disconnect || bc_connected {
+        return false;
+    }
+    liveness_gate_dead(last_frame_at, armed_at)
+}
+
 pub(super) async fn make_dummy_factory(
     camera: &NeoInstance,
     use_splash: bool,
@@ -622,24 +658,39 @@ pub(super) async fn make_dummy_factory(
     // unaffected: the dummy only splashes inside NEVER_CONNECTED_GRACE_MS,
     // and a camera that connects flips the gate open via last_frame_at.
     let gate_last_frame_at = camera.last_frame_at().await?;
-    let gate_name = camera.config().await?.borrow().name.clone();
+    let gate_config = camera.config().await?;
+    let gate_camera_watch = camera.camera();
+    let gate_name = gate_config.borrow().name.clone();
     let gate_armed_at = std::time::Instant::now();
-    NeoMediaFactory::new_with_callback(move |element| {
-        if liveness_gate_dead(&gate_last_frame_at, &gate_armed_at) {
-            log::info!(
-                "create_element: {gate_name} (dummy factory): camera not delivering frames (never-connected or stale >{GATE_STALENESS_MS}ms) — fast-failing DESCRIBE instead of serving splash (fix 14 liveness gate)"
-            );
-            return Ok(None);
-        }
+    let factory = NeoMediaFactory::new_with_callback(move |element| {
         clear_bin(&element)?;
-        if !use_splash {
-            Ok(None)
-        } else {
-            build_unknown(&element, &pattern)?;
-            Ok(Some(element))
-        }
+        build_unknown(&element, &pattern)?;
+        Ok(Some(element))
     })
-    .await
+    .await?;
+    // Both refusals happen in `construct`, so neither returns a NULL element
+    // (the pre-fix `Ok(None)` for `use_splash = false` printed the same two
+    // CRITICALs as the gate; upstream has the same). The client gets 400.
+    factory.set_describe_gate(move || {
+        if !use_splash {
+            return true;
+        }
+        let bc_connected = gate_camera_watch.borrow().upgrade().is_some();
+        let idle_disconnect = gate_config.borrow().idle_disconnect;
+        if describe_gate_dead(
+            bc_connected,
+            idle_disconnect,
+            &gate_last_frame_at,
+            &gate_armed_at,
+        ) {
+            log::info!(
+                "construct: {gate_name} (dummy factory): no BC session and camera not delivering frames (never-connected or stale >{GATE_STALENESS_MS}ms) — refusing DESCRIBE instead of serving splash (fix 14 liveness gate)"
+            );
+            return true;
+        }
+        false
+    });
+    Ok(factory)
 }
 
 enum ClientMsg {
@@ -664,7 +715,9 @@ pub(super) async fn make_factory(
     // Fetched here (async context) because the factory callback runs on the
     // shared glib main-loop thread where we can't await.
     let gate_last_frame_at = camera.last_frame_at().await?;
-    let gate_name = camera.config().await?.borrow().name.clone();
+    let gate_config = camera.config().await?;
+    let gate_camera_watch = camera.camera();
+    let gate_name = gate_config.borrow().name.clone();
     let gate_armed_at = std::time::Instant::now();
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
@@ -1468,15 +1521,11 @@ pub(super) async fn make_factory(
         // crashes/hour; the C-side de-assert in
         // docker/gst-rtsp-media-deassert.patch is the backstop, this gate
         // closes the window that reaches it). Dead-state predicate shared
-        // with make_dummy_factory — see liveness_gate_dead. Ok(None) -> gst
-        // fails this DESCRIBE cleanly; go2rtc just retries until the camera
-        // is back.
-        if liveness_gate_dead(&gate_last_frame_at, &gate_armed_at) {
-            log::info!(
-                "create_element: {gate_name}::{stream}: camera not delivering frames (never-connected or stale >{GATE_STALENESS_MS}ms) — fast-failing DESCRIBE (fix 14 liveness gate)"
-            );
-            return Ok(None);
-        }
+        // with make_dummy_factory — see describe_gate_dead. The gate itself
+        // is installed with set_describe_gate below and runs in the factory's
+        // `construct` vfunc, before this callback and before any element
+        // exists; a refused DESCRIBE gets 400 with no CRITICAL. go2rtc just
+        // retries until the camera is back.
         let (reply, new_element) = std::sync::mpsc::sync_channel(1);
         client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
 
@@ -1506,6 +1555,22 @@ pub(super) async fn make_factory(
         Ok(Some(element))
     })
     .await?;
+    factory.set_describe_gate(move || {
+        let bc_connected = gate_camera_watch.borrow().upgrade().is_some();
+        let idle_disconnect = gate_config.borrow().idle_disconnect;
+        if describe_gate_dead(
+            bc_connected,
+            idle_disconnect,
+            &gate_last_frame_at,
+            &gate_armed_at,
+        ) {
+            log::info!(
+                "construct: {gate_name}::{stream}: no BC session and camera not delivering frames (never-connected or stale >{GATE_STALENESS_MS}ms) — refusing DESCRIBE (fix 14 liveness gate)"
+            );
+            return true;
+        }
+        false
+    });
     Ok((factory, thread))
 }
 
@@ -3182,6 +3247,106 @@ mod tests {
             gate_dead(Some(GATE_STALENESS_MS + 1_000), long_ago),
             "a truly dead camera must still be gated"
         );
+    }
+
+    /// Evaluate the installed gate (`describe_gate_dead`) for a camera whose
+    /// frame clock was last stored `last_seen_ms_ago` ago (None = never),
+    /// with the given BC-session and idle_disconnect facts.
+    fn describe_dead(
+        bc_connected: bool,
+        idle_disconnect: bool,
+        last_seen_ms_ago: Option<u64>,
+        factory_age: Duration,
+    ) -> bool {
+        let now = crate::common::now_epoch_ms();
+        let last = Arc::new(AtomicU64::new(match last_seen_ms_ago {
+            None => 0,
+            Some(ago) => now.saturating_sub(ago),
+        }));
+        let armed_at = Instant::now()
+            .checked_sub(factory_age)
+            .expect("monotonic clock is old enough");
+        describe_gate_dead(bc_connected, idle_disconnect, &last, &armed_at)
+    }
+
+    /// Issue #202 (sonntam): the gate refused a camera whose factory had
+    /// mounted, i.e. one that had logged in. The frame clock cannot separate
+    /// "dead" from "connected, nobody watching", so the gate now also needs
+    /// the BC session to be down, and never fires for `idle_disconnect`.
+    #[test]
+    fn fix14_describe_gate_needs_a_dead_session_table() {
+        let old = Duration::from_secs(3600);
+        let young = Duration::from_secs(5);
+        let stale = Some(GATE_STALENESS_MS + 1_000);
+        let fresh = Some(1_000);
+        // (bc_connected, idle_disconnect, last_seen, factory_age, expect_dead, why)
+        let table: [(bool, bool, Option<u64>, Duration, bool, &str); 8] = [
+            (false, false, None, old, true, "never connected past grace: powered-off camera at start"),
+            (false, false, None, young, false, "never connected inside grace: still logging in"),
+            (false, false, stale, old, true, "session down, clock stale: died after a session"),
+            (false, false, fresh, old, false, "session down, clock fresh: mid idle-cycle reconnect"),
+            (true, false, stale, old, false, "session UP, clock stale: connected with no consumer (#202)"),
+            (true, false, None, old, false, "session UP before first frame clock store"),
+            (false, true, stale, old, false, "idle_disconnect: dead session is the idle state"),
+            (false, true, None, old, false, "idle_disconnect never-connected: waits for a consumer"),
+        ];
+        for (connected, idle, last, age, expect, why) in table {
+            let got = describe_dead(connected, idle, last, age);
+            eprintln!("[fix 14 #202] {why}: dead={got} (expected {expect})");
+            assert_eq!(got, expect, "{why}");
+        }
+        // The frame-only predicate is unchanged: the two refused rows above
+        // are exactly the rows it refuses on its own.
+        assert!(gate_dead(None, old) && gate_dead(stale, old));
+    }
+
+    /// The refusal happens in `construct`, so no element is ever created for
+    /// a gated DESCRIBE: the create_element callback must not run, and
+    /// `construct` must return None. (The NULL-element path is what printed
+    /// `g_object_force_floating: assertion 'G_IS_OBJECT (object)' failed` and
+    /// `could not create element` in the #202 report.)
+    #[test]
+    fn fix14_gated_describe_refuses_in_construct_without_an_element() {
+        use gstreamer_rtsp_server::prelude::RTSPMediaFactoryExt;
+        if gstreamer::init().is_err() {
+            eprintln!("SKIP fix14_gated_describe_refuses_in_construct_without_an_element: gst init failed");
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let callback_ran = Arc::new(AtomicBool::new(false));
+        let cb_flag = callback_ran.clone();
+        let factory = rt
+            .block_on(NeoMediaFactory::new_with_callback(move |element| {
+                cb_flag.store(true, Ordering::SeqCst);
+                Ok(Some(element))
+            }))
+            .expect("factory");
+        let gated = Arc::new(AtomicBool::new(true));
+        let gate_flag = gated.clone();
+        factory.set_describe_gate(move || gate_flag.load(Ordering::SeqCst));
+        let (_, url) = gstreamer_rtsp::RTSPUrl::parse("rtsp://127.0.0.1:8554/testcam/mainStream");
+        let url = url.expect("url");
+
+        let media = factory.construct(&url);
+        assert!(media.is_err(), "gated construct must return no media");
+        assert!(
+            !callback_ran.load(Ordering::SeqCst),
+            "gated DESCRIBE must not reach create_element"
+        );
+
+        // Same factory, gate open: the parent path runs and the callback
+        // builds the media (its launch line only needs core elements).
+        if !gst_elements_ready(&["videotestsrc", "textoverlay", "jpegenc", "rtpjpegpay"]) {
+            eprintln!("[fix 14 #202] open-gate half skipped: launch-line elements missing");
+            return;
+        }
+        gated.store(false, Ordering::SeqCst);
+        let media = factory.construct(&url);
+        assert!(media.is_ok(), "open gate must construct media");
+        assert!(callback_ran.load(Ordering::SeqCst), "open gate must reach the callback");
     }
 
     // =====================================================================

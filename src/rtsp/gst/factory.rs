@@ -125,6 +125,16 @@ impl NeoMediaFactory {
         Ok(factory)
     }
 
+    /// Install the DESCRIBE gate (see `NeoMediaFactoryImpl::describe_gate`).
+    /// The closure runs on gst-rtsp-server's glib main-loop thread and must
+    /// not block.
+    pub(crate) fn set_describe_gate<F>(&self, gate: F)
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        self.imp().set_describe_gate(gate);
+    }
+
     pub(crate) fn add_permitted_roles<T: AsRef<str>>(&self, permitted_roles: &HashSet<T>) {
         for permitted_role in permitted_roles {
             let s = permitted_role.as_ref();
@@ -171,6 +181,19 @@ unsafe impl Sync for NeoMediaFactory {}
 pub(crate) struct NeoMediaFactoryImpl {
     #[allow(clippy::type_complexity)]
     call_back: Arc<Mutex<Option<Arc<dyn Fn(Element) -> AnyResult<Option<Element>> + Send + Sync>>>>,
+    /// DESCRIBE gate, evaluated in the `construct` vfunc BEFORE any element
+    /// exists. `true` refuses the request: `construct` returns None, so
+    /// gst-rtsp-server's `find_media` answers the client with 400 and nothing
+    /// else happens. Refusing here rather than by returning None from
+    /// `create_element` avoids two CRITICALs: the gstreamer-rs 0.23
+    /// `create_element` trampoline calls `g_object_force_floating` on the NULL
+    /// it is handed (`GLib-GObject-CRITICAL ... G_IS_OBJECT`), and
+    /// rtsp-media-factory.c's `default_construct` then logs
+    /// `g_critical ("could not create element")`. `construct` returning NULL
+    /// hits neither (rtsp-media-factory.c: `media = klass->construct (...)`,
+    /// no assertion on a NULL result).
+    #[allow(clippy::type_complexity)]
+    describe_gate: std::sync::Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
 }
 
 impl Default for NeoMediaFactoryImpl {
@@ -179,6 +202,7 @@ impl Default for NeoMediaFactoryImpl {
         // Prepare thread that sends data into the appsrcs
         Self {
             call_back: Arc::new(Mutex::new(None)),
+            describe_gate: std::sync::Mutex::new(None),
         }
     }
 }
@@ -189,6 +213,25 @@ impl NeoMediaFactoryImpl {
         F: Fn(Element) -> AnyResult<Option<Element>> + Send + Sync + 'static,
     {
         self.call_back.lock().await.replace(Arc::new(callback));
+    }
+    fn set_describe_gate<F>(&self, gate: F)
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        self.describe_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(Arc::new(gate));
+    }
+    /// True if the DESCRIBE gate refuses this request. A poisoned lock or an
+    /// unset gate both mean "not gated".
+    fn describe_refused(&self) -> bool {
+        let gate = self
+            .describe_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        gate.map(|g| g()).unwrap_or(false)
     }
     fn build_pipeline(&self, media: Element) -> AnyResult<Option<Element>> {
         match self.call_back.blocking_lock().as_ref() {
@@ -209,6 +252,17 @@ impl NeoMediaFactoryImpl {
 
 impl ObjectImpl for NeoMediaFactoryImpl {}
 impl RTSPMediaFactoryImpl for NeoMediaFactoryImpl {
+    // Refuse a gated DESCRIBE at the media stage, not the element stage.
+    // gst_rtsp_media_factory_construct only reaches this vfunc when there is
+    // no reusable cached media, i.e. exactly when create_element would have
+    // been called, so the gate covers the same requests it did before.
+    fn construct(&self, url: &RTSPUrl) -> Option<gstreamer_rtsp_server::RTSPMedia> {
+        if self.describe_refused() {
+            return None;
+        }
+        self.parent_construct(url)
+    }
+
     fn create_element(&self, url: &RTSPUrl) -> Option<Element> {
         self.parent_create_element(url)
             .and_then(|orig| self.build_pipeline(orig).expect("Could not build pipeline"))
