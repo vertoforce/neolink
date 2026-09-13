@@ -118,7 +118,7 @@ impl NeoMediaFactory {
 
     pub(crate) async fn new_with_callback<F>(callback: F) -> AnyResult<Self>
     where
-        F: Fn(Element) -> AnyResult<Option<Element>> + Send + Sync + 'static,
+        F: Fn(Element) -> AnyResult<Element> + Send + Sync + 'static,
     {
         let factory = Self::new();
         factory.imp().set_callback(callback).await;
@@ -180,7 +180,7 @@ unsafe impl Sync for NeoMediaFactory {}
 
 pub(crate) struct NeoMediaFactoryImpl {
     #[allow(clippy::type_complexity)]
-    call_back: Arc<Mutex<Option<Arc<dyn Fn(Element) -> AnyResult<Option<Element>> + Send + Sync>>>>,
+    call_back: Arc<Mutex<Option<Arc<dyn Fn(Element) -> AnyResult<Element> + Send + Sync>>>>,
     /// DESCRIBE gate, evaluated in the `construct` vfunc BEFORE any element
     /// exists. `true` refuses the request: `construct` returns None, so
     /// gst-rtsp-server's `find_media` answers the client with 400 and nothing
@@ -194,6 +194,9 @@ pub(crate) struct NeoMediaFactoryImpl {
     /// no assertion on a NULL result).
     #[allow(clippy::type_complexity)]
     describe_gate: std::sync::Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    /// fix 18: the bin built in `construct`, handed to `create_element` by
+    /// the parent `construct` that immediately follows. See `construct`.
+    prebuilt: std::sync::Mutex<Option<Element>>,
 }
 
 impl Default for NeoMediaFactoryImpl {
@@ -203,6 +206,7 @@ impl Default for NeoMediaFactoryImpl {
         Self {
             call_back: Arc::new(Mutex::new(None)),
             describe_gate: std::sync::Mutex::new(None),
+            prebuilt: std::sync::Mutex::new(None),
         }
     }
 }
@@ -210,7 +214,7 @@ impl Default for NeoMediaFactoryImpl {
 impl NeoMediaFactoryImpl {
     async fn set_callback<F>(&self, callback: F)
     where
-        F: Fn(Element) -> AnyResult<Option<Element>> + Send + Sync + 'static,
+        F: Fn(Element) -> AnyResult<Element> + Send + Sync + 'static,
     {
         self.call_back.lock().await.replace(Arc::new(callback));
     }
@@ -233,19 +237,13 @@ impl NeoMediaFactoryImpl {
             .clone();
         gate.map(|g| g()).unwrap_or(false)
     }
-    fn build_pipeline(&self, media: Element) -> AnyResult<Option<Element>> {
+    /// Run the per-camera build callback on a freshly parsed launch bin.
+    /// An error means "no media this time" and is decided in `construct`;
+    /// it is never turned into a NULL element.
+    fn build_pipeline(&self, media: Element) -> AnyResult<Element> {
         match self.call_back.blocking_lock().as_ref() {
-            Some(call) => {
-                let new_media = call(media);
-                match new_media {
-                    Ok(new_media) => Ok(new_media),
-                    Err(e) => {
-                        log::debug!("Media source is currently restarting: {e:?}");
-                        Ok(None)
-                    }
-                }
-            }
-            None => Ok(None),
+            Some(call) => call(media),
+            None => Err(anyhow::anyhow!("no build callback installed")),
         }
     }
 }
@@ -260,12 +258,62 @@ impl RTSPMediaFactoryImpl for NeoMediaFactoryImpl {
         if self.describe_refused() {
             return None;
         }
-        self.parent_construct(url)
+        // fix 18: build the bin HERE, before the parent construct, so that a
+        // build that fails (fix 6 reply timeout, a closed build channel, a
+        // bin that will not clear) ends as "no media" from this vfunc, which
+        // the C caller handles with a plain 4xx. Previously the failure was
+        // an `Ok(None)` out of create_element: the gstreamer-rs glue called
+        // g_object_force_floating on that NULL and printed two
+        // GLib-GObject-CRITICALs per attempt (measured live: 2 per DESCRIBE
+        // at 30 s into an outage). create_element now only ever hands over
+        // the bin built here.
+        let raw = self.parent_create_element(url)?;
+        match self.build_pipeline(raw) {
+            Ok(built) => {
+                self.prebuilt
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .replace(built);
+            }
+            Err(e) => {
+                log::info!(
+                    "construct: pipeline build failed, refusing this DESCRIBE with no media (fix 18): {e:#}"
+                );
+                return None;
+            }
+        }
+        let media = self.parent_construct(url);
+        // The parent took it through create_element; never leave one behind.
+        self.prebuilt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        media
     }
 
+    /// Hands over the bin `construct` just built. gst-rtsp-server only calls
+    /// this vfunc from inside its default `construct`, which ours wraps, so
+    /// the slot is always filled; the fallback below exists for any other
+    /// caller and still never returns NULL: on a failed build it returns
+    /// the raw launch bin, which the media layer rejects as streamless.
     fn create_element(&self, url: &RTSPUrl) -> Option<Element> {
-        self.parent_create_element(url)
-            .and_then(|orig| self.build_pipeline(orig).expect("Could not build pipeline"))
+        if let Some(built) = self
+            .prebuilt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            return Some(built);
+        }
+        log::warn!("create_element called outside construct; building inline (fix 18 fallback)");
+        let raw = self.parent_create_element(url)?;
+        match self.build_pipeline(raw.clone()) {
+            Ok(built) => Some(built),
+            Err(e) => {
+                log::error!("create_element fallback: build failed, returning the raw launch bin rather than NULL: {e:#}");
+                Some(raw)
+            }
+        }
     }
 
     // DEBUG INSTRUMENTATION (Phase 1 root-cause capture). When

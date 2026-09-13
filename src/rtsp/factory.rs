@@ -620,10 +620,18 @@ fn liveness_gate_dead(
 ///   expected idle state and the DESCRIBE is what takes the permit that
 ///   reconnects it, so it must never be gated.
 ///
-/// What is still refused: a camera with no BC session whose frame clock is
-/// past the threshold (powered off after a session; reconnects failing) and
-/// a never-connected camera past NEVER_CONNECTED_GRACE_MS. Those are the two
-/// states fix 14 was written for.
+/// What is refused: a camera with no BC session that has had one before
+/// (`last_frame_at != 0`: powered off, mid-reconnect, reconnects failing) and
+/// a never-connected camera past NEVER_CONNECTED_GRACE_MS.
+///
+/// fix 18: the "had a session, none now" case no longer waits for the frame
+/// clock to pass GATE_STALENESS_MS. A DESCRIBE with no BC session cannot be
+/// served: its build would sit on the shared glib main loop for
+/// BUILD_REPLY_TIMEOUT waiting for frames that cannot come, then fail
+/// (measured live at 30 s into an outage: 400 after 8 s, two
+/// GLib-GObject-CRITICALs). Refusing here gives the same 400 in
+/// microseconds, keeps the main loop free for the other cameras, and the
+/// gate reopens the instant the camthread publishes the new session.
 fn describe_gate_dead(
     bc_connected: bool,
     idle_disconnect: bool,
@@ -632,6 +640,9 @@ fn describe_gate_dead(
 ) -> bool {
     if idle_disconnect || bc_connected {
         return false;
+    }
+    if last_frame_at.load(Ordering::Relaxed) != 0 {
+        return true;
     }
     liveness_gate_dead(last_frame_at, armed_at)
 }
@@ -665,7 +676,7 @@ pub(super) async fn make_dummy_factory(
     let factory = NeoMediaFactory::new_with_callback(move |element| {
         clear_bin(&element)?;
         build_unknown(&element, &pattern)?;
-        Ok(Some(element))
+        Ok(element)
     })
     .await?;
     // Both refusals happen in `construct`, so neither returns a NULL element
@@ -684,7 +695,7 @@ pub(super) async fn make_dummy_factory(
             &gate_armed_at,
         ) {
             log::info!(
-                "construct: {gate_name} (dummy factory): no BC session and camera not delivering frames (never-connected or stale >{GATE_STALENESS_MS}ms) — refusing DESCRIBE instead of serving splash (fix 14 liveness gate)"
+                "construct: {gate_name} (dummy factory): no BC session (never-connected past grace, or a session that is gone) — refusing DESCRIBE instead of serving splash (fix 14 liveness gate)"
             );
             return true;
         }
@@ -1552,7 +1563,7 @@ pub(super) async fn make_factory(
             );
             e
         })?;
-        Ok(Some(element))
+        Ok(element)
     })
     .await?;
     factory.set_describe_gate(move || {
@@ -1565,7 +1576,7 @@ pub(super) async fn make_factory(
             &gate_armed_at,
         ) {
             log::info!(
-                "construct: {gate_name}::{stream}: no BC session and camera not delivering frames (never-connected or stale >{GATE_STALENESS_MS}ms) — refusing DESCRIBE (fix 14 liveness gate)"
+                "construct: {gate_name}::{stream}: no BC session (never-connected past grace, or a session that is gone) — refusing DESCRIBE (fix 14 liveness gate)"
             );
             return true;
         }
@@ -3284,7 +3295,7 @@ mod tests {
             (false, false, None, old, true, "never connected past grace: powered-off camera at start"),
             (false, false, None, young, false, "never connected inside grace: still logging in"),
             (false, false, stale, old, true, "session down, clock stale: died after a session"),
-            (false, false, fresh, old, false, "session down, clock fresh: mid idle-cycle reconnect"),
+            (false, false, fresh, old, true, "session down, clock fresh: reconnect in progress, refused fast (fix 18)"),
             (true, false, stale, old, false, "session UP, clock stale: connected with no consumer (#202)"),
             (true, false, None, old, false, "session UP before first frame clock store"),
             (false, true, stale, old, false, "idle_disconnect: dead session is the idle state"),
@@ -3295,9 +3306,9 @@ mod tests {
             eprintln!("[fix 14 #202] {why}: dead={got} (expected {expect})");
             assert_eq!(got, expect, "{why}");
         }
-        // The frame-only predicate is unchanged: the two refused rows above
-        // are exactly the rows it refuses on its own.
-        assert!(gate_dead(None, old) && gate_dead(stale, old));
+        // The frame-only predicate is unchanged and still decides the
+        // never-connected rows.
+        assert!(gate_dead(None, old) && !gate_dead(None, young));
     }
 
     /// The gate across a reconnect. While the BC session is down and the
@@ -3320,40 +3331,106 @@ mod tests {
             describe_gate_dead(false, false, &clock, &armed_at),
             "documented window: no session and a stale clock is refused while the reconnect runs"
         );
-        // Reconnect lands: camthread run_camera stores now before the first frame.
+        // Reconnect lands: camthread run_camera publishes the session and
+        // stores now before the first frame. The session is what opens the
+        // gate (fix 18); the clock alone does not.
         clock.store(crate::common::now_epoch_ms(), Ordering::Relaxed);
         assert!(
-            !describe_gate_dead(false, false, &clock, &armed_at),
-            "the first DESCRIBE after the reconnect must be served even before a frame"
+            describe_gate_dead(false, false, &clock, &armed_at),
+            "no session yet: still refused, whatever the clock says"
         );
-        assert!(!describe_gate_dead(true, false, &clock, &armed_at));
+        assert!(
+            !describe_gate_dead(true, false, &clock, &armed_at),
+            "the first DESCRIBE after the session is published must be served even before a frame"
+        );
     }
 
-    /// fix 17 as seen from the gate: a camera that sat connected with no
-    /// subscriber for an hour has its clock held by the watchdog ticks, so
-    /// when the session then drops the 60 s reconnect budget starts at the
-    /// drop rather than being already spent. Before fix 17 the clock was an
-    /// hour stale and the first DESCRIBE after the drop was refused outright.
+    /// fix 18: once a camera has had a BC session, the gate follows the
+    /// session and nothing else. Session gone: refused, whether the clock is
+    /// an hour old or was re-stamped by the fix 17 hold a second ago. Session
+    /// back: served. `idle_disconnect` still bypasses everything.
     #[test]
-    fn fix14_a_held_clock_gives_a_dropped_session_its_full_budget() {
+    fn fix18_gate_follows_the_session_once_one_has_existed() {
         use std::sync::atomic::AtomicUsize;
         let old = Duration::from_secs(3600);
         let armed_at = Instant::now().checked_sub(old).expect("clock");
         let now = crate::common::now_epoch_ms();
         let clock = Arc::new(AtomicU64::new(now - 3_600_000));
-        let no_consumers = AtomicUsize::new(0);
-        // Last watchdog tick before the drop.
-        assert!(crate::common::hold_frame_clock(&no_consumers, &clock));
-        // Session drops; a DESCRIBE arrives 10 s into the reconnect.
-        let age_ms = crate::common::now_epoch_ms().saturating_sub(clock.load(Ordering::Relaxed));
-        assert!(age_ms < 10_000);
+        assert!(describe_gate_dead(false, false, &clock, &armed_at), "session gone, clock old");
+        assert!(crate::common::hold_frame_clock(&AtomicUsize::new(0), &clock));
+        assert!(describe_gate_dead(false, false, &clock, &armed_at), "session gone, clock fresh");
+        assert!(!describe_gate_dead(true, false, &clock, &armed_at), "session back");
+        assert!(!describe_gate_dead(false, true, &clock, &armed_at), "idle_disconnect bypasses");
+    }
+
+    /// fix 18: a build that fails must end as "no media" from `construct`,
+    /// never as a NULL element out of `create_element`. The NULL is what the
+    /// gstreamer-rs glue passed to g_object_force_floating, printing
+    /// `GLib-GObject-CRITICAL ** g_object_force_floating: assertion
+    /// 'G_IS_OBJECT (object)' failed`; this test captures GLib's log stream
+    /// and asserts no such line is emitted.
+    #[test]
+    fn fix18_failing_build_refuses_in_construct_without_a_null_element() {
+        use gstreamer_rtsp_server::prelude::RTSPMediaFactoryExt;
+        use std::sync::atomic::AtomicUsize;
+        if gstreamer::init().is_err() || !gst_elements_ready(&["videotestsrc", "jpegenc", "rtpjpegpay"]) {
+            eprintln!("SKIP fix18_failing_build_refuses_in_construct_without_a_null_element: gst or launch-line elements missing");
+            return;
+        }
+        static FORCE_FLOATING_CRITICALS: AtomicUsize = AtomicUsize::new(0);
+        fn note(msg: &str) {
+            if msg.contains("g_object_force_floating") {
+                FORCE_FLOATING_CRITICALS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        // Both GLib log paths: legacy g_log (what g_return_if_fail uses when
+        // the emitting library is not built with structured logging) and the
+        // structured writer.
+        gstreamer::glib::log_set_default_handler(|_domain, _level, msg| note(msg));
+        gstreamer::glib::log_set_writer_func(|_level, fields| {
+            for f in fields {
+                if f.key() == "MESSAGE" {
+                    if let Some(v) = f.value_str() {
+                        note(v);
+                    }
+                }
+            }
+            gstreamer::glib::LogWriterOutput::Handled
+        });
+        // Self-check that the capture sees a critical carrying that text.
+        gstreamer::glib::g_critical!("GLib-GObject", "g_object_force_floating: capture self-check");
         assert!(
-            !describe_gate_dead(false, false, &clock, &armed_at),
-            "a session that just dropped after a long idle must not be gated"
+            FORCE_FLOATING_CRITICALS.swap(0, Ordering::SeqCst) > 0,
+            "log capture did not see the self-check critical"
         );
-        // Without the hold (pre-fix 17) the same DESCRIBE was refused.
-        let stale = Arc::new(AtomicU64::new(now - 3_600_000));
-        assert!(describe_gate_dead(false, false, &stale, &armed_at));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_cb = calls.clone();
+        let factory = rt
+            .block_on(NeoMediaFactory::new_with_callback(move |_element| {
+                calls_cb.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("pipeline build did not reply (simulated fix 6 timeout)"))
+            }))
+            .expect("factory");
+        // A launch line the parent can parse from core plugins alone; the
+        // default one also needs textoverlay (pango), which not every box has.
+        factory.set_launch("videotestsrc ! jpegenc ! rtpjpegpay name=pay0");
+        let (_, url) = gstreamer_rtsp::RTSPUrl::parse("rtsp://127.0.0.1:8554/testcam/mainStream");
+        let url = url.expect("url");
+        let media = factory.construct(&url);
+        let criticals = FORCE_FLOATING_CRITICALS.load(Ordering::SeqCst);
+        eprintln!(
+            "[fix 18] failing build: construct media={} callback calls={} force_floating criticals={criticals}",
+            if media.is_ok() { "some" } else { "none" },
+            calls.load(Ordering::SeqCst)
+        );
+        assert!(media.is_err(), "a failed build must be no media");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the build runs exactly once per construct");
+        assert_eq!(criticals, 0, "a failed build must not reach g_object_force_floating(NULL)");
     }
 
     /// The refusal happens in `construct`, so no element is ever created for
@@ -3377,7 +3454,7 @@ mod tests {
         let factory = rt
             .block_on(NeoMediaFactory::new_with_callback(move |element| {
                 cb_flag.store(true, Ordering::SeqCst);
-                Ok(Some(element))
+                Ok(element)
             }))
             .expect("factory");
         let gated = Arc::new(AtomicBool::new(true));

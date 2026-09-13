@@ -85,6 +85,7 @@ The pipe path is simpler than both: one process per camera and the supervisor is
 | Orphan pump reaping | Each timed-out build leaked a thread, reaching 121 threads and 586 FDs in 72 h. | [#380](https://github.com/QuantumEntangledAndy/neolink/issues/380) | Verified |
 | Egress-liveness watchdog | The stall watchdog never saw fragmented frames, so it never armed on large streams. | [#346](https://github.com/QuantumEntangledAndy/neolink/issues/346) | Verified |
 | Frame clock held while unwatched | With `idle_disconnect = false` and no client, the frame-arrival watchdog read the silence as a death and re-logged-in every ~35 s for as long as nobody was watching. The watchdog now only enforces frame staleness while a video subscription is live. | none verified | Verified against the fake camera |
+| Failed builds refused in `construct` | A pipeline build that failed (reply timeout, closed build channel) came back as a NULL element from `create_element`, which the binding glue passed to `g_object_force_floating`: two GLib-GObject-CRITICALs per DESCRIBE at 30 s into an outage. The bin is now built in `construct`, a failure is "no media" with a plain 400, and a camera whose session is gone is refused in microseconds instead of holding the shared main loop for 8 s. Measured against the fake camera: 2 CRITICALs per outage DESCRIBE before, 0 after. | [#360](https://github.com/QuantumEntangledAndy/neolink/issues/360) | Verified against the fake camera |
 
 The pull requests are unchanged from their authors' branches, so upstream can merge them as-is.
 

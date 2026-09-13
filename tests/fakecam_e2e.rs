@@ -180,3 +180,47 @@ fn idle_camera_without_a_consumer_keeps_its_bc_session() {
     assert_eq!(deaths, 0, "an unwatched camera was declared dead {deaths} time(s) in 80 s");
     assert_eq!(reconnects, 0, "an unwatched camera reconnected {reconnects} time(s) in 80 s");
 }
+
+/// Send fakecam control commands (`die`, `hang`, `normal`, ...) in order.
+fn fakecam_ctl(ctl_port: u16, commands: &[&str]) {
+    let mut s = TcpStream::connect(("127.0.0.1", ctl_port)).expect("fakecam control port");
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 1024];
+    let _ = s.read(&mut buf); // banner
+    for c in commands {
+        s.write_all(format!("{c}\n").as_bytes()).expect("control write");
+        let _ = s.read(&mut buf);
+    }
+}
+
+/// fix 18: a DESCRIBE while the camera is unreachable must fail cleanly. It
+/// used to be a NULL element out of `create_element` after the 8 s build
+/// timeout, which the binding glue passed to `g_object_force_floating`
+/// and logged as two `GLib-GObject-CRITICAL` lines per attempt. The camera
+/// is cut with `die` (drop the session) then `hang` (accept TCP, never
+/// answer), which is what a camera that is reachable but dead looks like.
+#[test]
+fn describe_during_an_outage_leaves_no_glib_critical() {
+    if fakecam_bin().is_none() {
+        eprintln!("SKIP describe_during_an_outage_leaves_no_glib_critical: NEOLINK_E2E_FAKECAM unset");
+        return;
+    }
+    let rig = start("outage", false, 8563, 9063, 9073);
+    std::thread::sleep(Duration::from_secs(12));
+    let baseline = describe(rig.rtsp_port);
+    fakecam_ctl(9073, &["die", "hang"]);
+    std::thread::sleep(Duration::from_secs(30));
+    let t0 = Instant::now();
+    let during = describe(rig.rtsp_port);
+    let took = t0.elapsed();
+    let criticals = rig.log_count("CRITICAL");
+    let refusals = rig.log_count("refusing DESCRIBE");
+    let timeouts = rig.log_count("pipeline build did not reply");
+    eprintln!(
+        "[e2e outage] baseline {baseline:?}; 30 s into outage {during:?} in {took:?}; \
+         CRITICAL lines {criticals}, construct refusals {refusals}, build timeouts {timeouts}"
+    );
+    assert!(baseline.contains(" 200 "), "baseline DESCRIBE failed: {:?}", baseline);
+    assert!(!during.contains(" 200 "), "a DESCRIBE with the camera cut must not succeed: {:?}", during);
+    assert_eq!(criticals, 0, "GLib CRITICAL lines in the neolink log during the outage DESCRIBE");
+}
