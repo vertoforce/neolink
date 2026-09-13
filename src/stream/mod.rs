@@ -97,7 +97,34 @@ const LEARN_MAX_FRAMES: usize = 30;
 /// else is a camera-side reset (a reconnect), which must not add 2^32.
 const WRAP_GUARD: u32 = 0xF000_0000;
 /// Re-anchor the synthetic audio clock if it drifts this far from video.
+///
+/// This is the hard backstop: a reconnect, a camera clock rebase or a
+/// transcoder burst can leave the two clocks seconds apart, and only a snap
+/// recovers from that. Steady-state surplus is handled by the much tighter
+/// guard below, because a snap this large is itself a two second A/V jump.
 const AUDIO_RESYNC_90K: i64 = 2 * 90_000;
+/// Nominal audio frame length, used when the ADTS header could not be parsed.
+/// 1024 samples at 16 kHz, which is what the cameras on this path send.
+const AUDIO_FRAME_MICROS: u32 = 64_000;
+/// How far ahead of a newly arrived video stamp the audio clock may run, as a
+/// fraction of one audio frame, before the next audio frame is dropped: one
+/// and a half frames.
+///
+/// The comparison is made in `Clock::video`, against the stamp that has just
+/// arrived, never in `Clock::audio` against a stale one. Judging on every
+/// audio frame mistook a video delivery gap for surplus audio: while video
+/// was absent every audio frame past the band was dropped, and once video
+/// resumed the audio was left that far behind for the rest of the session
+/// (measured in the unit test: a 200 ms gap cost two frames and 61 ms of
+/// permanent lag). With no fresh video there is nothing to judge against, so
+/// a gap or a stall leaves the audio clock alone and the two second backstop
+/// covers it as before.
+///
+/// A one frame band flaps, because video arrives every 66 ms at 15 fps while
+/// audio frames arrive every 64 ms, so the measured lead oscillates by up to
+/// a frame with nothing wrong.
+const AUDIO_GUARD_NUM: i64 = 3;
+const AUDIO_GUARD_DEN: i64 = 2;
 
 /// Entry point for the stream subcommand.
 pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
@@ -519,8 +546,9 @@ fn write_ts(
         }
         BcMedia::Aac(frame) => {
             if mux.has_audio() {
-                let pts = clock.audio(frame.duration());
-                mux.write_audio(out, &frame.data, pts);
+                if let Some(pts) = clock.audio(frame.duration()) {
+                    mux.write_audio(out, &frame.data, pts);
+                }
             }
             false
         }
@@ -537,8 +565,9 @@ fn write_ts(
                 }
                 if mux.has_audio() {
                     for aac in &transcoded.frames {
-                        let pts = clock.audio(adts_duration_micros(aac));
-                        mux.write_audio(out, aac, pts);
+                        if let Some(pts) = clock.audio(adts_duration_micros(aac)) {
+                            mux.write_audio(out, aac, pts);
+                        }
                     }
                 }
             }
@@ -569,6 +598,14 @@ struct Clock {
     origin: Option<u64>,
     last_video_90k: u64,
     audio_90k: Option<u64>,
+    /// Audio frames dropped since the last re-anchor to hold the clock on video.
+    audio_drops: u64,
+    /// Length of the last audio frame in 90 kHz ticks (0 until one is seen),
+    /// so the guard band follows the source's sample rate.
+    audio_frame_90k: u64,
+    /// Set by `video` when the audio clock is more than the guard band ahead
+    /// of the stamp that just arrived; `audio` then drops one frame.
+    drop_next_audio: bool,
 }
 
 impl Clock {
@@ -593,7 +630,26 @@ impl Clock {
         let origin = *self.origin.get_or_insert(absolute);
         let pts = micros_to_90k(absolute.saturating_sub(origin));
         self.last_video_90k = pts;
+        // Judge the audio clock only here, against a stamp that has just
+        // arrived. See `AUDIO_GUARD_NUM` for why not on every audio frame.
+        // Re-evaluated on every video frame, so a pending drop is cancelled
+        // if the next stamp shows it is no longer needed.
+        if let Some(audio) = self.audio_90k {
+            let ahead = audio as i64 - pts as i64;
+            self.drop_next_audio = ahead > self.audio_guard_90k();
+        }
         pts
+    }
+
+    /// The guard band in 90 kHz ticks: one and a half audio frames, from the
+    /// last frame length seen (nominal until one has been).
+    fn audio_guard_90k(&self) -> i64 {
+        let frame = if self.audio_frame_90k == 0 {
+            micros_to_90k(u64::from(AUDIO_FRAME_MICROS))
+        } else {
+            self.audio_frame_90k
+        };
+        (frame as i64 * AUDIO_GUARD_NUM) / AUDIO_GUARD_DEN
     }
 
     /// Pin the audio clock to a known video PTS.
@@ -607,16 +663,62 @@ impl Clock {
 
     /// Next audio PTS, advancing by `duration` microseconds if the ADTS header
     /// could be parsed.
-    fn audio(&mut self, duration: Option<u32>) -> u64 {
+    ///
+    /// Returns `None` when the frame must be dropped because the audio clock
+    /// has run ahead of the camera's video clock. A camera that delivers more
+    /// audio frames than its own video clock accounts for (measured: 0.067%,
+    /// one surplus 1024 sample frame every 96 s) otherwise pushes that surplus
+    /// downstream forever. Dropping is the only correction that survives a
+    /// consumer which rebuilds the audio timeline by counting samples and
+    /// ignores the PTS entirely, which is what go2rtc's mp4 muxer did: there
+    /// the surplus became unbounded A/V drift, 2.4 s per hour, cleared only by
+    /// a reconnect.
+    ///
+    /// The decision to drop is taken in [`Clock::video`], when a fresh video
+    /// stamp arrives; this only carries it out. The clock is held while the
+    /// frame is dropped, so one dropped frame removes exactly one frame of
+    /// surplus and the PTS grid downstream stays continuous.
+    ///
+    /// Only the ahead direction is corrected. Audio behind video is left to
+    /// the `AUDIO_RESYNC_90K` snap above, because the frames that would close
+    /// the gap do not exist and inventing them (padding with silence) would
+    /// put made up audio into a recording. The same snap is the backstop for
+    /// the ahead direction while video is absent.
+    fn audio(&mut self, duration: Option<u32>) -> Option<u64> {
         let pts = *self.audio_90k.get_or_insert(self.last_video_90k);
         let drift = pts as i64 - self.last_video_90k as i64;
         if drift.abs() > AUDIO_RESYNC_90K {
             debug!("Audio clock drifted {drift} ticks from video, re-anchoring");
             self.audio_90k = Some(self.last_video_90k);
-            return self.last_video_90k;
+            self.audio_drops = 0;
+            self.drop_next_audio = false;
+            return Some(self.last_video_90k);
         }
+
+        if let Some(duration) = duration {
+            self.audio_frame_90k = micros_to_90k(u64::from(duration));
+        }
+
+        if std::mem::take(&mut self.drop_next_audio) {
+            // Hold the clock where it is: the video clock keeps moving, so
+            // each dropped frame removes exactly one frame of surplus.
+            self.audio_drops += 1;
+            if self.audio_drops == 1 {
+                info!(
+                    "Audio clock {drift} ticks ({} ms) ahead of video, dropping frames to hold it",
+                    drift / 90
+                );
+            } else {
+                debug!(
+                    "Audio clock {drift} ticks ahead of video, dropped {} frames this session",
+                    self.audio_drops
+                );
+            }
+            return None;
+        }
+
         self.audio_90k = Some(pts + micros_to_90k(u64::from(duration.unwrap_or(0))));
-        pts
+        Some(pts)
     }
 }
 
@@ -885,7 +987,9 @@ mod tests {
         let mut last_video = 0;
         for i in 0..300u64 {
             last_video = clock.video((i * 66_667) as u32);
-            let pts = clock.audio(Some(64_000));
+            let pts = clock
+                .audio(Some(64_000))
+                .expect("a source on the nominal rate must not have frames dropped");
             assert!(pts >= previous, "{} went backwards from {}", pts, previous);
             previous = pts;
         }
@@ -910,12 +1014,16 @@ mod tests {
         }
         // The held audio belongs at the start of that second, not at "now".
         clock.anchor_audio(0);
-        let first = clock.audio(Some(64_000));
+        let first = clock
+            .audio(Some(64_000))
+            .expect("held audio must not be dropped");
         assert_eq!(first, 0);
         // Flushing ~1 s of it lands back alongside the current video PTS.
         let mut pts = first;
         for _ in 0..14 {
-            pts = clock.audio(Some(64_000));
+            pts = clock
+                .audio(Some(64_000))
+                .expect("catching up audio must not be dropped");
         }
         let video = clock.last_video_90k;
         assert!(
@@ -934,12 +1042,169 @@ mod tests {
         // clock must be pulled back to video rather than running away.
         let mut pts = 0;
         for _ in 0..21 {
-            pts = clock.audio(Some(1_000_000));
+            if let Some(next) = clock.audio(Some(1_000_000)) {
+                pts = next;
+            }
         }
         assert!(
             pts <= micros_to_90k(3_000_000),
             "audio clock ran away to {}",
             pts
         );
+    }
+
+    /// Emit one hour of a camera whose audio runs `surplus` faster than its own
+    /// video clock, and report (kept, dropped, final drift, drift the old
+    /// accumulate-only clock would have reached).
+    fn run_surplus(surplus: f64) -> (u64, u64, i64, i64) {
+        const VIDEO_FRAME_MICROS: u64 = 66_667; // 15 fps
+        const SECONDS: u64 = 3600;
+
+        let mut clock = Clock::default();
+        let mut offered = 0u64;
+        let mut kept = 0u64;
+
+        let video_frames = SECONDS * 1_000_000 / VIDEO_FRAME_MICROS;
+        for i in 0..video_frames {
+            let video_micros = i * VIDEO_FRAME_MICROS;
+            clock.video(video_micros as u32);
+
+            // How many audio frames the camera has handed over by now.
+            let want = ((video_micros as f64 / f64::from(AUDIO_FRAME_MICROS)) * surplus) as u64;
+            while offered < want {
+                offered += 1;
+                if clock.audio(Some(AUDIO_FRAME_MICROS)).is_some() {
+                    kept += 1;
+                }
+            }
+        }
+
+        let video = clock.last_video_90k as i64;
+        let drift = clock.audio_90k.unwrap_or(0) as i64 - video;
+        // What an accumulate-only clock reaches: one frame per offered frame.
+        let undisciplined =
+            (offered as i64) * micros_to_90k(u64::from(AUDIO_FRAME_MICROS)) as i64 - video;
+
+        (kept, clock.audio_drops, drift, undisciplined)
+    }
+
+    /// The measured defect: the camera hands over 0.067% more AAC frames than
+    /// its own video clock accounts for (156.35 per 10.000 s of video where
+    /// 16 kHz gives 156.25). The clock must shed exactly that surplus instead
+    /// of carrying it until the two second snap fires.
+    #[test]
+    fn audio_clock_drops_only_the_surplus_frames() {
+        let (kept, dropped, drift, undisciplined) = run_surplus(1.000_67);
+        println!(
+            "surplus 0.067%: kept {kept}, dropped {dropped}, end drift {drift} ticks, \
+             accumulate-only drift {undisciplined} ticks ({} ms)",
+            undisciplined / 90
+        );
+
+        let frame = micros_to_90k(u64::from(AUDIO_FRAME_MICROS)) as i64;
+        let guard = (frame * AUDIO_GUARD_NUM) / AUDIO_GUARD_DEN;
+        // The band is judged once per video frame and at most one frame is
+        // dropped per judgement, while up to two audio frames arrive between
+        // judgements, so the clock may sit up to two frames past the band at
+        // any instant. What matters is that it never reaches the two second
+        // snap.
+        assert!(
+            drift <= guard + 2 * frame,
+            "audio ended {} ticks ahead of video, guard is {} plus two frames",
+            drift,
+            guard
+        );
+        assert!(dropped > 0, "no frame was dropped, surplus was absorbed");
+        // One hour of 0.067% surplus is ~37.7 frames, ~2.4 s.
+        assert!(
+            (30..=50).contains(&dropped),
+            "dropped {} frames, expected the ~38 frame surplus",
+            dropped
+        );
+        assert!(kept > 56_000, "dropped far too much: kept only {}", kept);
+        // For the record: what the old accumulate-only clock handed downstream
+        // between snaps, and what go2rtc then turned into unbounded drift.
+        assert!(
+            undisciplined > 2 * 90_000,
+            "surplus model is wrong, only {} ticks",
+            undisciplined
+        );
+    }
+
+    /// A camera whose audio matches its video clock must keep every frame.
+    #[test]
+    fn audio_clock_keeps_every_frame_at_the_nominal_rate() {
+        let (kept, dropped, drift, _) = run_surplus(1.0);
+        println!("nominal rate: kept {kept}, dropped {dropped}, end drift {drift} ticks");
+
+        assert_eq!(dropped, 0, "dropped {} frames at the nominal rate", dropped);
+        assert!(kept > 56_000, "kept only {} frames in an hour", kept);
+        assert!(
+            drift.abs() <= 6_000,
+            "drift {} ticks at the nominal rate",
+            drift
+        );
+    }
+    /// A camera-side video hiccup: video stops for `gap_micros` at t=600 s
+    /// while audio keeps arriving at the nominal rate, then resumes with
+    /// correct stamps. Returns (kept, dropped, final drift).
+    fn run_video_gap(gap_micros: u64) -> (u64, u64, i64) {
+        const VIDEO_FRAME_MICROS: u64 = 66_667; // 15 fps
+        const SECONDS: u64 = 1200;
+        const GAP_AT_MICROS: u64 = 600 * 1_000_000;
+
+        let mut clock = Clock::default();
+        let mut offered = 0u64;
+        let mut kept = 0u64;
+
+        let video_frames = SECONDS * 1_000_000 / VIDEO_FRAME_MICROS;
+        for i in 0..video_frames {
+            let video_micros = i * VIDEO_FRAME_MICROS;
+            let in_gap = video_micros >= GAP_AT_MICROS && video_micros < GAP_AT_MICROS + gap_micros;
+            if !in_gap {
+                clock.video(video_micros as u32);
+            }
+            let want = video_micros / u64::from(AUDIO_FRAME_MICROS);
+            while offered < want {
+                offered += 1;
+                if clock.audio(Some(AUDIO_FRAME_MICROS)).is_some() {
+                    kept += 1;
+                }
+            }
+        }
+        let drift = clock.audio_90k.unwrap_or(0) as i64 - clock.last_video_90k as i64;
+        (kept, clock.audio_drops, drift)
+    }
+
+    /// Nothing about the audio is wrong when video pauses, so no frame may be
+    /// dropped and the clocks must agree again once video is back. Gaps under
+    /// the two second backstop are the ones the guard alone has to get right;
+    /// judging the audio clock against a stale video stamp used to drop two
+    /// frames on a 200 ms gap and leave the audio 61 ms behind for good.
+    #[test]
+    fn audio_clock_ignores_a_video_gap() {
+        for gap_ms in [200u64, 500, 1500] {
+            let (kept, dropped, drift) = run_video_gap(gap_ms * 1000);
+            println!(
+                "{} ms video gap: kept {}, dropped {}, end drift {} ticks ({} ms)",
+                gap_ms,
+                kept,
+                dropped,
+                drift,
+                drift / 90
+            );
+            assert_eq!(
+                dropped, 0,
+                "dropped {} frames across a {} ms video gap",
+                dropped, gap_ms
+            );
+            assert!(
+                drift.abs() <= 6_000,
+                "drift {} ticks ({} ms) after a {} ms video gap",
+                drift,
+                drift / 90,
+                gap_ms
+            );
+        }
     }
 }
