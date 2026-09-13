@@ -113,6 +113,14 @@ Caveat: the pipe path's longest soak is 20 minutes against months for RTSP, and 
 
 ## Docker
 
+A prebuilt amd64 image tracks master:
+
+```bash
+docker pull vertoforce/neolink:master
+```
+
+Or build it yourself:
+
 ```bash
 docker build -t neolink:fork .
 ```
