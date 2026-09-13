@@ -3300,6 +3300,35 @@ mod tests {
         assert!(gate_dead(None, old) && gate_dead(stale, old));
     }
 
+    /// The gate across a reconnect. While the BC session is down and the
+    /// clock is past GATE_STALENESS_MS the DESCRIBE is refused: the gate
+    /// cannot tell a reconnect in progress from a camera that is gone, and a
+    /// DESCRIBE with no session could not be served anyway (its build would
+    /// wait BUILD_REPLY_TIMEOUT for frames that cannot come). That window is
+    /// documented here, not fixed. What matters is that it closes the moment
+    /// the reconnect lands: the camthread stores `last_frame_at = now` on
+    /// connect success (fix 5), before any frame, so the first DESCRIBE after
+    /// the reconnect goes through.
+    #[test]
+    fn fix14_gate_reopens_the_moment_a_reconnect_lands() {
+        let old = Duration::from_secs(3600);
+        let now = crate::common::now_epoch_ms();
+        let clock = Arc::new(AtomicU64::new(now - GATE_STALENESS_MS - 5_000));
+        let armed_at = Instant::now().checked_sub(old).expect("clock");
+        // Session dropped, reconnect in progress, clock 65 s stale.
+        assert!(
+            describe_gate_dead(false, false, &clock, &armed_at),
+            "documented window: no session and a stale clock is refused while the reconnect runs"
+        );
+        // Reconnect lands: camthread run_camera stores now before the first frame.
+        clock.store(crate::common::now_epoch_ms(), Ordering::Relaxed);
+        assert!(
+            !describe_gate_dead(false, false, &clock, &armed_at),
+            "the first DESCRIBE after the reconnect must be served even before a frame"
+        );
+        assert!(!describe_gate_dead(true, false, &clock, &armed_at));
+    }
+
     /// The refusal happens in `construct`, so no element is ever created for
     /// a gated DESCRIBE: the create_element callback must not run, and
     /// `construct` must return None. (The NULL-element path is what printed
