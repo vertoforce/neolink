@@ -84,6 +84,7 @@ The pipe path is simpler than both: one process per camera and the supervisor is
 | Dead-camera DESCRIBE gate | A powered-off camera was served a DESCRIBE and returned dead media, and the gate serves 0 of 10 DESCRIBEs against 4 of 10 without it. The `get_rates` assert that aborted the process is fixed by gst-rtsp-server 1.26.2 itself (gstreamer MR !7731), so only the DESCRIBE liveness gate is ours. | [#215](https://github.com/QuantumEntangledAndy/neolink/issues/215), [#286](https://github.com/QuantumEntangledAndy/neolink/issues/286), [#370](https://github.com/QuantumEntangledAndy/neolink/issues/370) | Verified |
 | Orphan pump reaping | Each timed-out build leaked a thread, reaching 121 threads and 586 FDs in 72 h. | [#380](https://github.com/QuantumEntangledAndy/neolink/issues/380) | Verified |
 | Egress-liveness watchdog | The stall watchdog never saw fragmented frames, so it never armed on large streams. | [#346](https://github.com/QuantumEntangledAndy/neolink/issues/346) | Verified |
+| Frame clock held while unwatched | With `idle_disconnect = false` and no client, the frame-arrival watchdog read the silence as a death and re-logged-in every ~35 s for as long as nobody was watching. The watchdog now only enforces frame staleness while a video subscription is live. | none verified | Verified against the fake camera |
 
 The pull requests are unchanged from their authors' branches, so upstream can merge them as-is.
 

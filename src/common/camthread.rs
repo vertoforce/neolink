@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Weak,
 };
 use tokio::{
@@ -48,6 +48,55 @@ pub(crate) struct NeoCamThread {
     /// Updated by `factory.rs::send_to_sources` on every push. Read here in
     /// the ping watchdog to decide whether to honor a ping timeout.
     last_frame_at: Arc<AtomicU64>,
+    /// Number of live BC video subscriptions (`start_video` tasks) on this
+    /// camera. See [`FrameConsumer`] and [`hold_frame_clock`].
+    frame_consumers: Arc<AtomicUsize>,
+}
+
+/// fix 17: a live BC video subscription. Held for the lifetime of every
+/// `start_video` task (`instance/gst.rs::stream`, `stream/mod.rs::subscribe`)
+/// so the watchdog knows whether frames are expected at all.
+///
+/// The fix 13 staleness check assumed a permanent consumer: "no frame for
+/// FRAME_STALENESS_MS" was a death. With `idle_disconnect = false` (the
+/// default) and no RTSP client, neolink keeps the BC session up but never
+/// asks the camera for video, so no frame ever arrives and the watchdog tore
+/// the session down and re-logged-in every ~35 s for as long as nobody was
+/// watching (measured against the fake camera, 100 s idle: a dead-declare
+/// every 34 s). Frames can only prove liveness while someone has asked for
+/// them.
+pub(crate) struct FrameConsumer {
+    counter: Arc<AtomicUsize>,
+}
+
+impl FrameConsumer {
+    pub(crate) fn hold(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for FrameConsumer {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// fix 17: one watchdog tick's view of the frame clock. With no video
+/// subscriber the clock measures nothing, so it is re-stamped to `now` and the
+/// staleness checks that follow on this tick see a fresh clock. Returns true
+/// when the clock was held.
+///
+/// This also keeps the fix 14 DESCRIBE gate honest: a camera that sat idle
+/// for an hour and then lost its session starts its 60 s reconnect budget at
+/// the drop, not at the last frame.
+pub(crate) fn hold_frame_clock(frame_consumers: &AtomicUsize, last_frame_at: &AtomicU64) -> bool {
+    if frame_consumers.load(Ordering::SeqCst) == 0 {
+        last_frame_at.store(now_epoch_ms(), Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
 }
 
 impl NeoCamThread {
@@ -57,6 +106,7 @@ impl NeoCamThread {
         camera_watch_tx: WatchSender<Weak<BcCamera>>,
         cancel: CancellationToken,
         last_frame_at: Arc<AtomicU64>,
+        frame_consumers: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             state: watch_state_rx,
@@ -64,6 +114,7 @@ impl NeoCamThread {
             cancel,
             camera_watch: camera_watch_tx,
             last_frame_at,
+            frame_consumers,
         }
     }
     async fn run_camera(&mut self, config: &CameraConfig) -> AnyResult<()> {
@@ -90,6 +141,7 @@ impl NeoCamThread {
 
         let cancel_check = self.cancel.clone();
         let last_frame_at = self.last_frame_at.clone();
+        let frame_consumers = self.frame_consumers.clone();
         let watchdog_name = name.clone();
         // Now we wait for a disconnect
         tokio::select! {
@@ -105,6 +157,10 @@ impl NeoCamThread {
                 let mut missed_pings: u32 = 0;
                 loop {
                     interval.tick().await;
+                    // fix 17: no subscriber, no frames expected, no staleness.
+                    if hold_frame_clock(&frame_consumers, &last_frame_at) {
+                        log::trace!("{watchdog_name}: no video subscriber, frame clock held");
+                    }
                     log::trace!("Sending ping");
                     match timeout(Duration::from_secs(5), camera.get_linktype()).await {
                         Ok(Ok(_)) => {
@@ -149,6 +205,7 @@ impl NeoCamThread {
                             // Fall through into a frames-only watchdog loop.
                             loop {
                                 interval.tick().await;
+                                hold_frame_clock(&frame_consumers, &last_frame_at);
                                 if tick_declares_dead(
                                     PingTick::Unsupported,
                                     frames_stale(&last_frame_at),
@@ -547,5 +604,58 @@ mod tests {
         assert!(!tick_declares_dead(PingTick::Unsupported, false));
         assert!(tick_declares_dead(PingTick::Failed, false));
         assert!(tick_declares_dead(PingTick::Failed, true));
+    }
+
+    /// fix 17: a `FrameConsumer` is one live video subscription; the count
+    /// follows its lifetime exactly.
+    #[test]
+    fn a_frame_consumer_counts_only_while_it_lives() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let a = FrameConsumer::hold(counter.clone());
+        let b = FrameConsumer::hold(counter.clone());
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        drop(a);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        drop(b);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    /// fix 17: with nobody subscribed the frame clock is held at `now` on
+    /// every tick, so a camera that is connected but not being watched is
+    /// never declared dead. With a subscriber the clock is left alone and the
+    /// fix 13 policy applies unchanged.
+    #[test]
+    fn an_idle_camera_without_subscribers_is_never_declared_dead() {
+        let consumers = Arc::new(AtomicUsize::new(0));
+        // Ticks are 5 s apart; advance the clock by pulling last_frame_at back.
+        fn advance_5s(clock: &AtomicU64) {
+            clock.fetch_sub(5_000, Ordering::Relaxed);
+        }
+        let clock = frame_at(0);
+        let mut deaths_idle = 0;
+        for _ in 0..20 {
+            advance_5s(&clock);
+            hold_frame_clock(&consumers, &clock);
+            if tick_declares_dead(PingTick::Answered, frames_stale(&clock)) {
+                deaths_idle += 1;
+            }
+        }
+        // Same 100 s of silence with one subscriber that never gets a frame.
+        let _consumer = FrameConsumer::hold(consumers.clone());
+        let clock = frame_at(0);
+        let mut first_death_tick = None;
+        for tick in 1..=20 {
+            advance_5s(&clock);
+            assert!(!hold_frame_clock(&consumers, &clock), "a subscriber must not hold the clock");
+            if tick_declares_dead(PingTick::Answered, frames_stale(&clock)) {
+                first_death_tick.get_or_insert(tick);
+            }
+        }
+        eprintln!(
+            "[fix 17] 100 s without frames: no subscriber -> {deaths_idle} death(s); \
+             one starved subscriber -> first death at tick {first_death_tick:?}"
+        );
+        assert_eq!(deaths_idle, 0, "idle camera without a subscriber was declared dead");
+        assert_eq!(first_death_tick, Some(7), "starved subscriber must still be a death past 30 s");
     }
 }

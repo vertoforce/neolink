@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::common::UseCounter;
+use crate::common::{FrameConsumer, UseCounter};
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 use neolink_core::{bc_protocol::StreamKind, bcmedia::model::BcMedia};
 use tokio::sync::mpsc::Receiver as MpscReceiver;
@@ -180,12 +180,18 @@ impl NeoInstance {
         let config = self.config().await?.borrow().clone();
         let strict = config.strict;
         let thread_camera = self.clone();
+        let frame_consumers = self.frame_consumers().await?;
         tokio::task::spawn(
             tokio::task::spawn(async move {
                 thread_camera
                     .run_task(move |cam| {
                         let media_tx = media_tx.clone();
+                        let frame_consumers = frame_consumers.clone();
                         Box::pin(async move {
+                            // fix 17: frames are expected from here until this
+                            // task ends; the camthread watchdog enforces frame
+                            // staleness only while a consumer like this exists.
+                            let _consumer = FrameConsumer::hold(frame_consumers);
                             let mut media_stream = cam.start_video(stream, 0, strict).await?;
                             log::trace!("Camera started");
                             while let Ok(media) = media_stream.get_data().await? {

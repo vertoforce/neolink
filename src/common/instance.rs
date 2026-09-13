@@ -6,7 +6,10 @@
 //! whenever the camera is lost/updated
 use anyhow::{anyhow, Context};
 use futures::TryFutureExt;
-use std::sync::{atomic::AtomicU64, Arc, Weak};
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize},
+    Arc, Weak,
+};
 use tokio::{
     sync::{
         mpsc::Sender as MpscSender, oneshot::channel as oneshot, watch::Receiver as WatchReceiver,
@@ -292,6 +295,17 @@ impl NeoInstance {
         let (instance_tx, instance_rx) = oneshot();
         self.camera_control
             .send(NeoCamCommand::GetLastFrameAt(instance_tx))
+            .await?;
+        Ok(instance_rx.await?)
+    }
+
+    /// fix 17: the live-video-subscription counter. Every `start_video` task
+    /// holds a `FrameConsumer` on it for as long as it runs; the camthread
+    /// watchdog only enforces frame staleness while it is non-zero.
+    pub(crate) async fn frame_consumers(&self) -> Result<Arc<AtomicUsize>> {
+        let (instance_tx, instance_rx) = oneshot();
+        self.camera_control
+            .send(NeoCamCommand::GetFrameConsumers(instance_tx))
             .await?;
         Ok(instance_rx.await?)
     }

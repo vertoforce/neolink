@@ -3329,6 +3329,33 @@ mod tests {
         assert!(!describe_gate_dead(true, false, &clock, &armed_at));
     }
 
+    /// fix 17 as seen from the gate: a camera that sat connected with no
+    /// subscriber for an hour has its clock held by the watchdog ticks, so
+    /// when the session then drops the 60 s reconnect budget starts at the
+    /// drop rather than being already spent. Before fix 17 the clock was an
+    /// hour stale and the first DESCRIBE after the drop was refused outright.
+    #[test]
+    fn fix14_a_held_clock_gives_a_dropped_session_its_full_budget() {
+        use std::sync::atomic::AtomicUsize;
+        let old = Duration::from_secs(3600);
+        let armed_at = Instant::now().checked_sub(old).expect("clock");
+        let now = crate::common::now_epoch_ms();
+        let clock = Arc::new(AtomicU64::new(now - 3_600_000));
+        let no_consumers = AtomicUsize::new(0);
+        // Last watchdog tick before the drop.
+        assert!(crate::common::hold_frame_clock(&no_consumers, &clock));
+        // Session drops; a DESCRIBE arrives 10 s into the reconnect.
+        let age_ms = crate::common::now_epoch_ms().saturating_sub(clock.load(Ordering::Relaxed));
+        assert!(age_ms < 10_000);
+        assert!(
+            !describe_gate_dead(false, false, &clock, &armed_at),
+            "a session that just dropped after a long idle must not be gated"
+        );
+        // Without the hold (pre-fix 17) the same DESCRIBE was refused.
+        let stale = Arc::new(AtomicU64::new(now - 3_600_000));
+        assert!(describe_gate_dead(false, false, &stale, &armed_at));
+    }
+
     /// The refusal happens in `construct`, so no element is ever created for
     /// a gated DESCRIBE: the create_element callback must not run, and
     /// `construct` must return None. (The NULL-element path is what printed

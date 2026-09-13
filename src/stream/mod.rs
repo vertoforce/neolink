@@ -70,7 +70,7 @@ mod adpcm;
 mod cmdline;
 mod mpegts;
 
-use crate::common::{now_epoch_ms, NeoInstance, NeoReactor};
+use crate::common::{now_epoch_ms, FrameConsumer, NeoInstance, NeoReactor};
 use crate::AnyResult;
 use aac::{adts_duration_micros, AdpcmTranscoder};
 use cmdline::{AudioMode, Format};
@@ -237,10 +237,21 @@ fn subscribe(camera: &NeoInstance, stream: StreamKind, strict: bool) -> Receiver
     let (media_tx, media_rx) = channel(100);
     let camera = camera.clone();
     tokio::task::spawn(async move {
+        let frame_consumers = match camera.frame_consumers().await {
+            Ok(counter) => counter,
+            Err(e) => {
+                warn!("BC video subscription could not register as a consumer: {e:?}");
+                return;
+            }
+        };
         let result = camera
             .run_task(move |cam| {
                 let media_tx = media_tx.clone();
+                let frame_consumers = frame_consumers.clone();
                 Box::pin(async move {
+                    // fix 17: the pipe is a permanent consumer, so the
+                    // camthread frame-staleness watchdog stays armed for it.
+                    let _consumer = FrameConsumer::hold(frame_consumers);
                     let mut media_stream = cam.start_video(stream, 0, strict).await?;
                     debug!("BC video subscription started");
                     while let Ok(media) = media_stream.get_data().await? {

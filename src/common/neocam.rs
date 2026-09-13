@@ -6,7 +6,10 @@
 //!    Clonable interface to share amongst threadsanyhow::anyhow;
 use anyhow::Context;
 use futures::{stream::StreamExt, TryFutureExt};
-use std::sync::{atomic::AtomicU64, Arc, Weak};
+use std::sync::{
+    atomic::{AtomicU64, AtomicUsize},
+    Arc, Weak,
+};
 use tokio::{
     sync::{
         mpsc::{channel as mpsc, Sender as MpscSender},
@@ -45,6 +48,9 @@ pub(crate) enum NeoCamCommand {
     /// timeouts when frames are still flowing. See `camthread.rs` for the
     /// full rationale.
     GetLastFrameAt(OneshotSender<Arc<AtomicU64>>),
+    /// fix 17: hand out the live-video-subscription counter that every
+    /// `start_video` task holds a [`FrameConsumer`] on.
+    GetFrameConsumers(OneshotSender<Arc<AtomicUsize>>),
     #[cfg(feature = "pushnoti")]
     PushNoti(OneshotSender<WatchReceiver<Option<PushNoti>>>),
     GetUid(OneshotSender<String>),
@@ -74,6 +80,9 @@ impl NeoCam {
         // gate the BC ping watchdog; the rtsp factory writes it on every
         // pushed frame.
         let last_frame_at = Arc::new(AtomicU64::new(0));
+        // fix 17: how many BC video subscriptions are live. The camthread
+        // holds the frame clock while this is zero.
+        let frame_consumers = Arc::new(AtomicUsize::new(0));
 
         let set = JoinSet::new();
         let users = UseCounter::new().await;
@@ -96,6 +105,7 @@ impl NeoCam {
         let thread_commander_tx = commander_tx.clone();
         let thread_watch_config_rx = watch_config_rx.clone();
         let thread_last_frame_at = last_frame_at.clone();
+        let thread_frame_consumers = frame_consumers.clone();
         #[cfg(feature = "pushnoti")]
         let thread_pn_request_tx = pn_request_tx.clone();
 
@@ -151,6 +161,9 @@ impl NeoCam {
                             NeoCamCommand::GetLastFrameAt(sender) => {
                                 let _ = sender.send(thread_last_frame_at.clone());
                             }
+                            NeoCamCommand::GetFrameConsumers(sender) => {
+                                let _ = sender.send(thread_frame_consumers.clone());
+                            }
                             #[cfg(feature = "pushnoti")]
                             NeoCamCommand::PushNoti(sender) => {
                                 thread_pn_request_tx.send(
@@ -194,6 +207,7 @@ impl NeoCam {
             camera_watch_tx,
             me.cancel.clone(),
             last_frame_at.clone(),
+            frame_consumers.clone(),
         )
         .await;
         me.set.spawn(async move { cam_thread.run().await });
