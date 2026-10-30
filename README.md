@@ -663,6 +663,23 @@ You can control the status LED using
 neolink status-light --config=config.toml CameraName [on|off]
 ```
 
+### Healthcheck
+
+Intended for a container `HEALTHCHECK` (see [Docker](#docker) below). Reports a
+camera unhealthy when its stream is actively being served to a client but has
+stopped delivering frames - a frozen pipeline that keeps the process "running"
+and the RTSP port open, which a plain port check cannot see. It reads the
+bridge's own heartbeat rather than opening its own RTSP pull, so it never
+competes with a real consumer for a camera's limited stream slots. A camera
+nobody is pulling has no heartbeat and is never reported unhealthy.
+
+```bash
+neolink healthcheck --config=config.toml [CameraName] [--timeout=10]
+```
+
+Exit code 0 means no actively-served stream is frozen; non-zero means at
+least one is. Omit `CameraName` to check every configured camera.
+
 ### Talk
 
 You can talk over the camera using
