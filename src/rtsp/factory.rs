@@ -964,6 +964,8 @@ pub(super) async fn make_factory(
                             let mut aud_ts: u64 = 0;
                             let mut vid_ts: u64 = 0;
                             let mut pools = Default::default();
+                            // Gate the stream to start on the first keyframe; see send_to_sources.
+                            let mut seen_keyframe = false;
                             // Thread lifecycle: drop the frame and keep going
                             // on transient send errors, but EXIT after EOS so
                             // the next client connection rebuilds cleanly via
@@ -1124,6 +1126,7 @@ pub(super) async fn make_factory(
                                     &aud_src,
                                     &mut vid_ts,
                                     &mut aud_ts,
+                                    &mut seen_keyframe,
                                     &stream_config,
                                 );
                             }
@@ -1352,6 +1355,7 @@ pub(super) async fn make_factory(
                                     &aud_src,
                                     &mut vid_ts,
                                     &mut aud_ts,
+                                    &mut seen_keyframe,
                                     &stream_config,
                                 ) {
                                     Ok(SendOutcome::Sent) => {
@@ -1629,6 +1633,7 @@ fn send_to_sources(
     aud_src: &Option<AppSrc>,
     vid_ts: &mut u64,
     aud_ts: &mut u64,
+    seen_keyframe: &mut bool,
     stream_config: &StreamConfig,
 ) -> AnyResult<SendOutcome> {
     // Track whether ANY push in this call hit Flushing. The video path is
@@ -1681,8 +1686,10 @@ fn send_to_sources(
             }
             *aud_ts += duration as u64;
         }
-        BcMedia::Iframe(BcMediaIframe { data, .. })
-        | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
+        BcMedia::Iframe(BcMediaIframe { data, .. }) => {
+            // A keyframe carries the in-band SPS/PPS the parser needs, so the
+            // stream is safe to start here.
+            *seen_keyframe = true;
             if let Some(vid_src) = vid_src.as_ref() {
                 // fix 11: drop-OLDEST-under-pressure (was drop-NEWEST via
                 // a34c36c). The video appsrc now carries leaky-type=downstream
@@ -1697,6 +1704,32 @@ fn send_to_sources(
                 // the terminal "App source is closed" detach path (check_live)
                 // and back-pressure Flushing — those protections are unchanged.
                 // A rate-limited near-full log keeps the leaky drops observable.
+                let max = vid_src.max_bytes();
+                if max > 0 && vid_src.current_level_bytes() >= max * 9 / 10 {
+                    log_video_near_full(vid_src);
+                }
+                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
+                if let SendOutcome::BackPressured =
+                    send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?
+                {
+                    outcome = SendOutcome::BackPressured;
+                }
+            }
+            const MICROSECONDS: u64 = 1000000;
+            *vid_ts += MICROSECONDS / stream_config.fps as u64;
+        }
+        BcMedia::Pframe(BcMediaPframe { data, .. }) => {
+            if !*seen_keyframe {
+                // Drop P-frames that arrive before the first keyframe. A
+                // client that starts mid-GOP has no SPS/PPS and no reference
+                // frame, so the parser emits garbage and a recorder writes
+                // empty/broken segments (seen after a Frigate restart).
+                // Don't advance the timestamp for a frame we drop, so the
+                // first keyframe we do send starts the stream cleanly, and
+                // don't count this as a push outcome either way.
+                return Ok(outcome);
+            }
+            if let Some(vid_src) = vid_src.as_ref() {
                 let max = vid_src.max_bytes();
                 if max > 0 && vid_src.current_level_bytes() >= max * 9 / 10 {
                     log_video_near_full(vid_src);
